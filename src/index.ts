@@ -237,6 +237,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
         resolved: true, shape: "llmCompletion", content,
         provider: "anthropic", model,
         usage: { input_tokens: response.usage.input_tokens, output_tokens: response.usage.output_tokens },
+        stop_reason: response.stop_reason,
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -330,6 +331,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
           input_tokens: response.usage?.prompt_tokens ?? 0,
           output_tokens: response.usage?.completion_tokens ?? 0,
         },
+        stop_reason: response.choices[0]?.finish_reason === "length" ? "max_tokens" : response.choices[0]?.finish_reason,
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
