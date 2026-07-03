@@ -95,6 +95,8 @@ interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; m
 const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   { id: "chutes", baseURL: "https://llm.chutes.ai/v1", apiKeyEnv: "CHUTES_API_KEY",
     models: ["zai-org/GLM-5.1-TEE", "zai-org/GLM-5.2-TEE", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"] },
+  { id: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY",
+    models: ["openai/gpt-oss-120b:free", "qwen/qwen3-coder:free", "z-ai/glm-5.2", "moonshotai/kimi-k2.6", "deepseek/deepseek-v3.2", "x-ai/grok-4.3", "qwen/qwen3-coder-next"] },
 ];
 const modelClientMap = new Map<string, OpenAI>();
 for (const p of OPENAI_WIRE_PROVIDERS) {
