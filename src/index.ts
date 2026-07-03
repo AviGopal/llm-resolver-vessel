@@ -52,7 +52,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL; // default: OpenAI; set for Ollama/Groq/etc.
 const LLM_PROVIDER = (process.env.LLM_PROVIDER ?? "auto") as "anthropic" | "openai" | "auto";
 
-const DEFAULT_MODEL = process.env.LLM_DEFAULT_MODEL ?? "claude-sonnet-4-6";
+const DEFAULT_MODEL = process.env.LLM_DEFAULT_MODEL || "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS = 4096;
 
 // Retired Anthropic model ids that callers still hardcode and that 404 at the API.
