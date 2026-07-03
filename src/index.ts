@@ -90,6 +90,21 @@ if (OPENAI_API_KEY) {
   console.warn("[llm-resolver-vessel] Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY set. All resolve calls will fail.");
 }
 
+// OpenAI-wire-compatible provider registry: add a service as data, not a new code path.
+interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; models: string[]; }
+const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
+  { id: "chutes", baseURL: "https://llm.chutes.ai/v1", apiKeyEnv: "CHUTES_API_KEY",
+    models: ["zai-org/GLM-5.1-TEE", "zai-org/GLM-5.2-TEE", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"] },
+];
+const modelClientMap = new Map<string, OpenAI>();
+for (const p of OPENAI_WIRE_PROVIDERS) {
+  const key = process.env[p.apiKeyEnv];
+  if (!key) continue;
+  const client = new OpenAI({ apiKey: key, baseURL: p.baseURL });
+  for (const m of p.models) modelClientMap.set(m, client);
+  console.log(`[llm-resolver-vessel] OpenAI-wire provider '${p.id}': ${p.baseURL} (${p.models.length} models)`);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider routing
 // ─────────────────────────────────────────────────────────────────────────────
@@ -410,6 +425,8 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   }
 
   const model = body.model ?? DEFAULT_MODEL;
+  const wireClient = modelClientMap.get(model);
+  if (wireClient) return resolveWithOpenAI(body, wireClient);
   const provider = pickProvider(model, body.provider);
 
   if (!provider) {
