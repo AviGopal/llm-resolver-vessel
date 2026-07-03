@@ -287,8 +287,8 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
 // OpenAI-compatible resolution path (OpenAI, Ollama, Groq, Together, vLLM, …)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function resolveWithOpenAI(body: LlmCompletionRequest): Promise<Record<string, unknown>> {
-  if (!openaiClient) {
+async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | null = openaiClient): Promise<Record<string, unknown>> {
+  if (!client) {
     return { resolved: false, shape: "llmCompletion", error: "OPENAI_API_KEY not configured" };
   }
 
@@ -302,7 +302,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest): Promise<Record<str
 
   if (!body.tools || body.tools.length === 0) {
     try {
-      const response = await openaiClient.chat.completions.create({
+      const response = await client.chat.completions.create({
         model,
         max_tokens: maxTokens,
         messages: [...systemMessages, { role: "user", content: body.prompt }],
@@ -353,7 +353,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest): Promise<Record<str
   for (let iter = 1; iter <= maxIter; iter++) {
     let response: OpenAI.Chat.ChatCompletion;
     try {
-      response = await openaiClient.chat.completions.create({
+      response = await client.chat.completions.create({
         model, max_tokens: maxTokens, messages,
         ...(oaiTools.length > 0 ? { tools: oaiTools } : {}),
       });
