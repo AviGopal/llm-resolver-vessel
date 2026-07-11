@@ -244,6 +244,7 @@ interface LlmCompletionRequest {
   provider?: "anthropic" | "openai" | "auto";
   max_tokens?: number;
   system?: string;
+  images?: Array<{ media_type: string; data: string }>;
   tools?: AnthropicToolDef[];
   tool_dispatch_endpoint?: string;
   tool_dispatch_api_key?: string;
@@ -270,13 +271,19 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   const stripped = rawModel.startsWith("anthropic/") ? rawModel.slice("anthropic/".length) : rawModel;
   const model = RETIRED_ANTHROPIC_MODEL_IDS.has(stripped) ? DEFAULT_MODEL : stripped;
   const maxTokens = body.max_tokens ?? DEFAULT_MAX_TOKENS;
+  const userContent: any = body.images && body.images.length > 0
+    ? [
+        ...body.images.map((img) => ({ type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } })),
+        { type: "text", text: body.prompt },
+      ]
+    : body.prompt;
 
   if (!body.tools || body.tools.length === 0) {
     try {
       const response = await anthropic.messages.create({
         model, max_tokens: maxTokens,
         ...(body.system ? { system: body.system } : {}),
-        messages: [{ role: "user", content: body.prompt }],
+        messages: [{ role: "user", content: userContent }],
       });
       const content = response.content
         .filter((b) => b.type === "text")
@@ -305,7 +312,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   }
 
   const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [
-    { role: "user", content: body.prompt },
+    { role: "user", content: userContent },
   ];
   const toolCalls: ToolCallTraceEntry[] = [];
   let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
