@@ -142,6 +142,42 @@ const DEFAULT_TOOL_DISPATCH_ENDPOINT =
   process.env.LLM_TOOL_DISPATCH_ENDPOINT ?? "http://127.0.0.1:8090/v2/impulses/resolve";
 const DEFAULT_MAX_TOOL_ITERATIONS = parseInt(process.env.LLM_MAX_TOOL_ITERATIONS ?? "8", 10);
 
+const TOOL_ENDPOINT_CACHE = new Map<string, string>();
+
+async function resolveToolEndpoint(toolName: string, fallback: string): Promise<string> {
+  const cached = TOOL_ENDPOINT_CACHE.get(toolName);
+  if (cached) return cached;
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (API_KEY) headers.Authorization = `ApiKey ${API_KEY}`;
+    const res = await fetch(`${DISCOVERY_ENDPOINT}/resolve`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ pointer: { type: "vesselCapability", shape: toolName } }),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) {
+      TOOL_ENDPOINT_CACHE.set(toolName, fallback);
+      return fallback;
+    }
+    const body = (await res.json()) as { content?: { vessels?: Array<{ endpoint?: string; resolve_endpoint?: string }> } };
+    const vessel = body?.content?.vessels?.[0];
+    if (!vessel || !vessel.endpoint || !vessel.resolve_endpoint) {
+      TOOL_ENDPOINT_CACHE.set(toolName, fallback);
+      return fallback;
+    }
+    const re = vessel.resolve_endpoint;
+    const url = re.startsWith("http://") || re.startsWith("https://")
+      ? re
+      : `${vessel.endpoint.replace(/\/$/, "")}${re.startsWith("/") ? re : "/" + re}`;
+    TOOL_ENDPOINT_CACHE.set(toolName, url);
+    return url;
+  } catch {
+    TOOL_ENDPOINT_CACHE.set(toolName, fallback);
+    return fallback;
+  }
+}
+
 async function dispatchTool(
   endpoint: string,
   apiKey: string,
@@ -152,7 +188,8 @@ async function dispatchTool(
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 60_000);
   try {
-    const res = await fetch(endpoint, {
+    const target = await resolveToolEndpoint(toolName, endpoint);
+    const res = await fetch(target, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
