@@ -262,6 +262,41 @@ interface ToolCallTraceEntry {
 // ─────────────────────────────────────────────────────────────────────────────
 // Anthropic resolution path (existing, preserved)
 // ─────────────────────────────────────────────────────────────────────────────
+async function anthropicCreditFallback(err: unknown, body: LlmCompletionRequest): Promise<Record<string, unknown> | null> {
+  const message = err instanceof Error ? err.message : String(err);
+  const status = (err as { status?: number } | null)?.status;
+  const errType = (err as { error?: { type?: string; message?: string } } | null)?.error?.type;
+  const errMsg = (err as { error?: { type?: string; message?: string } } | null)?.error?.message ?? "";
+  const combined = `${message} ${errMsg}`.toLowerCase();
+  const isCreditDead = combined.includes("credit balance is too low") ||
+    (status === 400 && errType === "invalid_request_error" && (combined.includes("billing") || combined.includes("credit")));
+  if (!isCreditDead) return null;
+  const fallbackModel = process.env.LLM_FALLBACK_MODEL;
+  if (!fallbackModel) return null;
+  const client = modelClientMap.get(fallbackModel);
+  if (!client) return null;
+  console.log(`[llm-resolver-vessel] anthropic credit-dead — falling back to ${fallbackModel}`);
+  try {
+    const messages: Array<{ role: "system" | "user"; content: string }> = [];
+    if (body.system) messages.push({ role: "system", content: body.system });
+    messages.push({ role: "user", content: body.prompt ?? "" });
+    const completion = await client.chat.completions.create({
+      model: fallbackModel,
+      max_tokens: body.max_tokens ?? DEFAULT_MAX_TOKENS,
+      messages,
+    });
+    const content = completion.choices?.[0]?.message?.content ?? "";
+    return {
+      resolved: true, shape: "llmCompletion", content,
+      provider: "openai-wire", model: fallbackModel,
+      fallback_from: "anthropic-credit",
+    };
+  } catch (fallbackErr) {
+    console.error("[llm-resolver-vessel] fallback error:", fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr));
+    return null;
+  }
+}
+
 
 async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<string, unknown>> {
   if (!anthropic) {
@@ -297,6 +332,8 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const fallback = await anthropicCreditFallback(err, body);
+      if (fallback) return fallback;
       console.error("[llm-resolver-vessel] anthropic error:", message);
       return { resolved: false, shape: "llmCompletion", error: message };
     }
