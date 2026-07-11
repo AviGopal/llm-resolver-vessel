@@ -111,7 +111,17 @@ for (const p of OPENAI_WIRE_PROVIDERS) {
 // Provider routing
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Maps retired model IDs to current equivalents so callers using old hardcoded ids still work.
+const RETIRED_MODEL_ALIASES: Record<string, string> = {
+  "claude-sonnet-4-20250514": "claude-sonnet-5",
+};
+
+function remapModel(model: string): string {
+  return RETIRED_MODEL_ALIASES[model] ?? model;
+}
+
 function pickProvider(model: string, explicitProvider?: string): "anthropic" | "openai" | null {
+  model = remapModel(model);
   if (explicitProvider === "anthropic") return anthropic ? "anthropic" : null;
   if (explicitProvider === "openai") return openaiClient ? "openai" : null;
 
