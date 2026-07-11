@@ -150,7 +150,7 @@ function pickProvider(model: string, explicitProvider?: string): "anthropic" | "
 
 const DEFAULT_TOOL_DISPATCH_ENDPOINT =
   process.env.LLM_TOOL_DISPATCH_ENDPOINT ?? "http://127.0.0.1:8090/v2/impulses/resolve";
-const DEFAULT_MAX_TOOL_ITERATIONS = parseInt(process.env.LLM_MAX_TOOL_ITERATIONS ?? "8", 10);
+const DEFAULT_MAX_TOOL_ITERATIONS = parseInt(process.env.LLM_MAX_TOOL_ITERATIONS ?? "20", 10);
 
 const TOOL_ENDPOINT_CACHE = new Map<string, string>();
 
@@ -298,7 +298,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   // Tool-use loop (Anthropic)
   const dispatchEndpoint = body.tool_dispatch_endpoint ?? DEFAULT_TOOL_DISPATCH_ENDPOINT;
   const dispatchApiKey = body.tool_dispatch_api_key ?? process.env.METABOB_API_KEY ?? "";
-  const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 20));
+  const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
   const hasClientSideTools = body.tools.some((t) => !t.type || t.type === "custom");
   if (hasClientSideTools && !dispatchApiKey) {
     return { resolved: false, shape: "llmCompletion", error: "tool-use with client-side tools requires METABOB_API_KEY" };
@@ -392,7 +392,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
   // Tool-use loop (OpenAI format)
   const dispatchEndpoint = body.tool_dispatch_endpoint ?? DEFAULT_TOOL_DISPATCH_ENDPOINT;
   const dispatchApiKey = body.tool_dispatch_api_key ?? process.env.METABOB_API_KEY ?? "";
-  const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 20));
+  const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
   if (!dispatchApiKey) {
     return { resolved: false, shape: "llmCompletion", error: "tool-use requires METABOB_API_KEY" };
   }
