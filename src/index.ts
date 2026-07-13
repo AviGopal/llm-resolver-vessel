@@ -47,12 +47,18 @@ const DISCOVERY_ENDPOINT = process.env.DISCOVERY_VESSEL_ENDPOINT ?? "http://127.
 const API_KEY = process.env.LLM_RESOLVER_VESSEL_API_KEY ?? process.env.METABOB_API_KEY;
 
 // Provider config
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL; // default: OpenAI; set for Ollama/Groq/etc.
-const LLM_PROVIDER = (process.env.LLM_PROVIDER ?? "auto") as "anthropic" | "openai" | "auto";
+// Env values arrive quoted from some generators (VAR="") - a quote-only or empty
+// value must read as ABSENT, or we construct clients with bogus credentials.
+function cleanEnv(v: string | undefined): string | undefined {
+  const t = (v ?? "").trim().replace(/^["']+|["']+$/g, "").trim();
+  return t.length > 0 ? t : undefined;
+}
+const ANTHROPIC_API_KEY = cleanEnv(process.env.ANTHROPIC_API_KEY);
+const OPENAI_API_KEY = cleanEnv(process.env.OPENAI_API_KEY);
+const OPENAI_BASE_URL = cleanEnv(process.env.OPENAI_BASE_URL); // default: OpenAI; set for Ollama/Groq/etc.
+const LLM_PROVIDER = (cleanEnv(process.env.LLM_PROVIDER) ?? "auto") as "anthropic" | "openai" | "auto";
 
-const DEFAULT_MODEL = process.env.LLM_DEFAULT_MODEL || "claude-sonnet-5";
+const DEFAULT_MODEL = cleanEnv(process.env.LLM_DEFAULT_MODEL) ?? "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS = 4096;
 
 // Retired Anthropic model ids that callers still hardcode and that 404 at the API.
@@ -95,15 +101,18 @@ interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; m
 const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   { id: "chutes", baseURL: "https://llm.chutes.ai/v1", apiKeyEnv: "CHUTES_API_KEY",
     models: ["zai-org/GLM-5.1-TEE", "zai-org/GLM-5.2-TEE", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"] },
-  { id: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY",
-    models: ["openai/gpt-oss-120b:free", "qwen/qwen3-coder:free", "z-ai/glm-5.2", "moonshotai/kimi-k2.6", "deepseek/deepseek-v3.2", "x-ai/grok-4.3", "qwen/qwen3-coder-next"] },
+  // OpenRouter serves arbitrary vendor/model ids - it is the catch-all for any
+  // slash-qualified model not explicitly mapped above (see resolve entry point).
+  { id: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY", models: [] },
 ];
 const modelClientMap = new Map<string, OpenAI>();
+let openrouterClient: OpenAI | null = null;
 for (const p of OPENAI_WIRE_PROVIDERS) {
-  const key = process.env[p.apiKeyEnv];
+  const key = cleanEnv(process.env[p.apiKeyEnv]);
   if (!key) continue;
   const client = new OpenAI({ apiKey: key, baseURL: p.baseURL });
   for (const m of p.models) modelClientMap.set(m, client);
+  if (p.id === "openrouter") openrouterClient = client;
   console.log(`[llm-resolver-vessel] OpenAI-wire provider '${p.id}': ${p.baseURL} (${p.models.length} models)`);
 }
 
