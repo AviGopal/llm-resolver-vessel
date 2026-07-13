@@ -531,6 +531,10 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   const model = body.model ?? DEFAULT_MODEL;
   const wireClient = modelClientMap.get(model);
   if (wireClient) return resolveWithOpenAI(body, wireClient);
+  // Any vendor/model id not explicitly mapped routes through OpenRouter when keyed.
+  if (openrouterClient && model.includes("/") && !model.toLowerCase().startsWith("anthropic/")) {
+    return resolveWithOpenAI(body, openrouterClient);
+  }
   const provider = pickProvider(model, body.provider);
 
   if (!provider) {
