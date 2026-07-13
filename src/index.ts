@@ -36,6 +36,7 @@ import {
   VesselDaemon,
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
+import { selectArm, recordArmOutcome, llmModelPolicyHandler, llmModelPolicyWriteHandler } from "./model-policy.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -557,6 +558,26 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
 // VesselDaemon
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Policy-selected completion: when the caller does not pin a model (absent or
+// "auto"), select one by cost/reach/uncertainty (Thompson over the shaped
+// llmModelPolicy) and record the choice + technical outcome. Pinned calls pass
+// through ungraded (causal discipline).
+const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
+  const body = ctx.body as LlmCompletionRequest;
+  const pinned = typeof body.model === "string" && body.model.length > 0 && body.model !== "auto";
+  if (pinned) return llmCompletionHandler(ctx);
+  const sel = await selectArm();
+  if (!sel) return llmCompletionHandler(ctx);
+  const result = await llmCompletionHandler({ ...ctx, body: { ...body, model: sel.model } } as never);
+  try {
+    (result as Record<string, unknown>).model_selection = sel.meta;
+    await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true);
+  } catch (err) {
+    console.warn("[llm-resolver-vessel] policy outcome record failed (non-fatal):", err);
+  }
+  return result;
+};
+
 const runtime = new ExecutionRuntime({
   attachedVessels: [
     { id: VESSEL_ID, kind: "custom" as never, resolverIds: ["llm_completion"] },
@@ -566,14 +587,16 @@ const runtime = new ExecutionRuntime({
 const executor = new ActivityExecutor(runtime);
 
 const resolvers = new Map<string, ResolverHandler>([
-  ["llm_completion", llmCompletionHandler],
+  ["llm_completion", llmCompletionWithPolicyHandler],
+  ["llmModelPolicy", llmModelPolicyHandler as never],
+  ["llmModelPolicy_write", llmModelPolicyWriteHandler as never],
 ]);
 
 const daemon = new VesselDaemon({
   port: PORT,
   vesselId: VESSEL_ID,
   vesselName: "LLM Resolver Vessel",
-  shapes: ["llm_completion", "llmCompletion"],
+  shapes: ["llm_completion", "llmCompletion", "llmModelPolicy", "llmModelPolicy_write"],
   executor,
   resolvers,
   discoveryEndpoint: DISCOVERY_ENDPOINT,
