@@ -107,8 +107,16 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   // Free-tier openrouter models (verified live 2026-07-14) — the last-resort
   // completion plane when both anthropic and chutes are credit-exhausted.
   // Free slugs drift; keep several and let the exhaustion fallback walk them.
+  // PAID openrouter models first (verified live 2026-07-14, real balance) — the
+  // sustained-capacity plane: reliable non-reasoning models that don't burn the
+  // token budget on hidden reasoning the way the free reasoning models do, and
+  // no account-wide free daily cap. The :free models stay LAST as true
+  // last-resort (they 429 account-wide under load). Order within openrouter is a
+  // cold-start prior, not a learned policy — see gap
+  // tool-affordance-not-a-shaped-impulse / dispatch-time selection should be shaped.
   { id: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY",
-    models: ["nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free", "tencent/hy3:free"] },
+    models: ["google/gemini-2.5-flash", "openai/gpt-4o-mini", "deepseek/deepseek-chat-v3-0324",
+             "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free", "tencent/hy3:free"] },
 ];
 const modelClientMap = new Map<string, OpenAI>();
 let openrouterClient: OpenAI | null = null;
