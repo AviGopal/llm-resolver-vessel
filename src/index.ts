@@ -550,8 +550,32 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
     };
   }
 
-  if (provider === "anthropic") return resolveWithAnthropic(body);
-  return resolveWithOpenAI(body);
+  // Billing/quota-exhaustion fallback (credit-outage law: use ALL keyed
+  // providers; a dead primary must not take the whole substrate's LLM plane
+  // down with it). On an exhausted-provider error, retry across the
+  // OpenAI-wire provider registry's models until one resolves.
+  const isExhaustedProviderError = (e: unknown): boolean => {
+    const m = String(e ?? "").toLowerCase();
+    return (
+      m.includes("credit balance") ||
+      m.includes("insufficient_quota") ||
+      m.includes("exceeded your current quota") ||
+      m.includes("billing")
+    );
+  };
+  const result = provider === "anthropic" ? await resolveWithAnthropic(body) : await resolveWithOpenAI(body);
+  if (result.resolved !== true && isExhaustedProviderError(result.error)) {
+    const tried = new Set<string>([model]);
+    for (const [fbModel, client] of modelClientMap) {
+      if (tried.has(fbModel)) continue;
+      tried.add(fbModel);
+      console.warn(`[llm-resolver-vessel] provider exhausted for '${model}' — falling back to '${fbModel}'`);
+      const fb = await resolveWithOpenAI({ ...body, model: fbModel }, client);
+      if (fb.resolved === true) return { ...fb, fallback_from: model };
+      if (tried.size >= 4) break;
+    }
+  }
+  return result;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
