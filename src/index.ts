@@ -312,6 +312,46 @@ async function anthropicCreditFallback(err: unknown, body: LlmCompletionRequest)
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Prompt caching (Anthropic path)
+//
+// Caching is a byte-prefix match; render order is tools → system → messages.
+// The tool-use loop below re-sends the full growing history every iteration
+// (up to max_tool_iterations), so caching the shared prefix is the real win:
+// system gets a stable breakpoint, and a single sliding breakpoint rides the
+// last block of the last message each iteration (max 4 markers per request —
+// we use at most 2). Prefixes below the model's minimum (1k–4k tokens)
+// silently don't cache, which is harmless. Cache reads report in
+// usage.cache_read_input_tokens.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CACHE_EPHEMERAL = { type: "ephemeral" as const };
+
+function cachedSystem(system: string | undefined): Record<string, unknown> {
+  if (!system) return {};
+  return { system: [{ type: "text", text: system, cache_control: CACHE_EPHEMERAL }] };
+}
+
+// Move the message-side breakpoint to the last block of the last message,
+// clearing any marker set on a previous iteration so we never exceed the
+// 4-breakpoint request limit as the loop grows the history.
+function slideCacheBreakpoint(messages: Array<{ role: string; content: unknown }>): void {
+  for (const m of messages) {
+    if (Array.isArray(m.content)) {
+      for (const b of m.content) {
+        if (b && typeof b === "object" && "cache_control" in (b as Record<string, unknown>)) {
+          delete (b as Record<string, unknown>)["cache_control"];
+        }
+      }
+    }
+  }
+  const last = messages[messages.length - 1];
+  if (last && Array.isArray(last.content) && last.content.length > 0) {
+    const b = last.content[last.content.length - 1];
+    if (b && typeof b === "object") (b as Record<string, unknown>)["cache_control"] = CACHE_EPHEMERAL;
+  }
+}
+
 async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<string, unknown>> {
   if (!anthropic) {
     return { resolved: false, shape: "llmCompletion", error: "ANTHROPIC_API_KEY not configured" };
@@ -331,7 +371,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
     try {
       const response = await anthropic.messages.create({
         model, max_tokens: maxTokens,
-        ...(body.system ? { system: body.system } : {}),
+        ...cachedSystem(body.system),
         messages: [{ role: "user", content: userContent }],
       });
       const content = response.content
@@ -341,7 +381,12 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
       return {
         resolved: true, shape: "llmCompletion", content,
         provider: "anthropic", model,
-        usage: { input_tokens: response.usage.input_tokens, output_tokens: response.usage.output_tokens },
+        usage: {
+          input_tokens: response.usage.input_tokens,
+          output_tokens: response.usage.output_tokens,
+          cache_creation_input_tokens: (response.usage as { cache_creation_input_tokens?: number }).cache_creation_input_tokens ?? 0,
+          cache_read_input_tokens: (response.usage as { cache_read_input_tokens?: number }).cache_read_input_tokens ?? 0,
+        },
         stop_reason: response.stop_reason,
       };
     } catch (err) {
@@ -363,18 +408,25 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   }
 
   const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [
-    { role: "user", content: userContent },
+    {
+      role: "user",
+      content: Array.isArray(userContent)
+        ? userContent
+        : [{ type: "text", text: userContent as string }],
+    },
   ];
   const toolCalls: ToolCallTraceEntry[] = [];
   let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
+  let totalCacheReadTokens = 0, totalCacheWriteTokens = 0;
 
   for (let iter = 1; iter <= maxIter; iter++) {
     let response;
     try {
+      slideCacheBreakpoint(messages);
       response = await anthropic.messages.create({
         model, max_tokens: maxTokens,
         tools: body.tools as unknown as Anthropic.Messages.Tool[],
-        ...(body.system ? { system: body.system } : {}),
+        ...cachedSystem(body.system),
         messages: messages as unknown as Anthropic.Messages.MessageParam[],
       });
     } catch (err) {
@@ -382,6 +434,8 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
     }
     totalInputTokens += response.usage.input_tokens;
     totalOutputTokens += response.usage.output_tokens;
+    totalCacheReadTokens += (response.usage as { cache_read_input_tokens?: number }).cache_read_input_tokens ?? 0;
+    totalCacheWriteTokens += (response.usage as { cache_creation_input_tokens?: number }).cache_creation_input_tokens ?? 0;
     messages.push({ role: "assistant", content: response.content });
     if (response.stop_reason !== "tool_use") {
       finalText = response.content.filter((b) => b.type === "text").map((b) => (b as { type: "text"; text: string }).text).join("");
@@ -402,7 +456,12 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
     provider: "anthropic", model,
     tool_calls: toolCalls,
     iterations: toolCalls.length > 0 ? toolCalls[toolCalls.length - 1]!.iteration : 0,
-    usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens },
+    usage: {
+      input_tokens: totalInputTokens,
+      output_tokens: totalOutputTokens,
+      cache_creation_input_tokens: totalCacheWriteTokens,
+      cache_read_input_tokens: totalCacheReadTokens,
+    },
   };
 }
 
@@ -526,6 +585,39 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
 // Unified resolver handler
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-request provider-exhaustion memory (auto-failover + auto-recovery).
+// A provider that fails with a billing/quota error is skipped for a cooldown
+// window instead of being retried on every request; after the window expires
+// it is tried again automatically, and a success clears the mark — so when a
+// key regains balance the substrate reverts to its preferred provider with no
+// operator action. Cooldown is bootstrap-tunable via LLM_EXHAUSTION_COOLDOWN_MS.
+const EXHAUSTION_COOLDOWN_MS =
+  Number.parseInt(process.env.LLM_EXHAUSTION_COOLDOWN_MS ?? "", 10) > 0
+    ? Number.parseInt(process.env.LLM_EXHAUSTION_COOLDOWN_MS ?? "", 10)
+    : 10 * 60 * 1000;
+const exhaustedUntil = new Map<string, number>();
+const providerKeyOf = (client: OpenAI): string => String((client as { baseURL?: unknown }).baseURL ?? "openai-wire");
+const inCooldown = (key: string): boolean => (exhaustedUntil.get(key) ?? 0) > Date.now();
+const markExhausted = (key: string): void => {
+  exhaustedUntil.set(key, Date.now() + EXHAUSTION_COOLDOWN_MS);
+  console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(EXHAUSTION_COOLDOWN_MS / 1000)}s before retry`);
+};
+const clearExhausted = (key: string): void => {
+  if (exhaustedUntil.delete(key)) console.warn(`[llm-resolver-vessel] provider '${key}' recovered — resuming preferred routing`);
+};
+const isExhaustedProviderError = (e: unknown): boolean => {
+  const m = String(e ?? "").toLowerCase();
+  return (
+    m.includes("credit balance") ||
+    m.includes("insufficient_quota") ||
+    m.includes("exceeded your current quota") ||
+    m.includes("usage cap") ||
+    m.includes("402") ||
+    m.includes("billing")
+  );
+};
+
 const llmCompletionHandler: ResolverHandler = async (ctx) => {
   const body = ctx.body as LlmCompletionRequest;
 
@@ -556,32 +648,51 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
 
   // Billing/quota-exhaustion fallback (credit-outage law: use ALL keyed
   // providers; a dead primary must not take the whole substrate's LLM plane
-  // down with it). On an exhausted-provider error, retry across the
-  // OpenAI-wire provider registry's models until one resolves.
-  const isExhaustedProviderError = (e: unknown): boolean => {
-    const m = String(e ?? "").toLowerCase();
-    return (
-      m.includes("credit balance") ||
-      m.includes("insufficient_quota") ||
-      m.includes("exceeded your current quota") ||
-      m.includes("billing")
-    );
-  };
-  const result = provider === "anthropic" ? await resolveWithAnthropic(body) : await resolveWithOpenAI(body);
-  if (result.resolved !== true && isExhaustedProviderError(result.error)) {
+  // down with it). Providers in exhaustion cooldown are skipped up front and
+  // retried automatically after the window — auto-failover, auto-recovery.
+  const primaryKey = provider;
+  const primaryCoolingDown = inCooldown(primaryKey);
+  let result: Record<string, unknown>;
+  if (primaryCoolingDown) {
+    result = { resolved: false, shape: "llmCompletion", error: `${primaryKey} cooling down after credit/quota exhaustion (auto-retries after cooldown)` };
+  } else {
+    result = provider === "anthropic" ? await resolveWithAnthropic(body) : await resolveWithOpenAI(body);
+    if (result.resolved === true) {
+      clearExhausted(primaryKey);
+    } else if (isExhaustedProviderError(result.error)) {
+      markExhausted(primaryKey);
+    }
+  }
+  if (result.resolved !== true && (primaryCoolingDown || isExhaustedProviderError(result.error))) {
     const tried = new Set<string>([model]);
     const deadClients = new Set<OpenAI>();
     for (const [fbModel, client] of modelClientMap) {
-      if (tried.has(fbModel) || deadClients.has(client)) continue;
+      const key = providerKeyOf(client);
+      if (tried.has(fbModel) || deadClients.has(client) || inCooldown(key)) continue;
       tried.add(fbModel);
       console.warn(`[llm-resolver-vessel] provider exhausted for '${model}' — falling back to '${fbModel}'`);
       const fb = await resolveWithOpenAI({ ...body, model: fbModel }, client);
-      if (fb.resolved === true) return { ...fb, fallback_from: model };
-      // A billing/quota failure on one model condemns the whole client —
-      // skip its sibling models instead of burning the walk on them.
-      if (isExhaustedProviderError(fb.error) || String(fb.error ?? "").includes("402")) {
-        deadClients.add(client);
+      if (fb.resolved === true) {
+        clearExhausted(key);
+        return { ...fb, fallback_from: model };
       }
+      // A billing/quota failure on one model condemns the whole client for a
+      // cooldown window — skip its sibling models and remember across requests.
+      if (isExhaustedProviderError(fb.error)) {
+        deadClients.add(client);
+        markExhausted(key);
+      }
+    }
+    // Last resort: every fallback lane is dead or cooling down — try the
+    // primary anyway even mid-cooldown (its balance may have just returned).
+    if (primaryCoolingDown) {
+      const retry = provider === "anthropic" ? await resolveWithAnthropic(body) : await resolveWithOpenAI(body);
+      if (retry.resolved === true) {
+        clearExhausted(primaryKey);
+        return retry;
+      }
+      if (isExhaustedProviderError(retry.error)) markExhausted(primaryKey);
+      return retry;
     }
   }
   return result;
