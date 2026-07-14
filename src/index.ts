@@ -104,7 +104,11 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
     models: ["zai-org/GLM-5.1-TEE", "zai-org/GLM-5.2-TEE", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"] },
   // OpenRouter serves arbitrary vendor/model ids - it is the catch-all for any
   // slash-qualified model not explicitly mapped above (see resolve entry point).
-  { id: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY", models: [] },
+  // Free-tier openrouter models (verified live 2026-07-14) — the last-resort
+  // completion plane when both anthropic and chutes are credit-exhausted.
+  // Free slugs drift; keep several and let the exhaustion fallback walk them.
+  { id: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY",
+    models: ["nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free", "tencent/hy3:free"] },
 ];
 const modelClientMap = new Map<string, OpenAI>();
 let openrouterClient: OpenAI | null = null;
