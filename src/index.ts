@@ -570,13 +570,18 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   const result = provider === "anthropic" ? await resolveWithAnthropic(body) : await resolveWithOpenAI(body);
   if (result.resolved !== true && isExhaustedProviderError(result.error)) {
     const tried = new Set<string>([model]);
+    const deadClients = new Set<OpenAI>();
     for (const [fbModel, client] of modelClientMap) {
-      if (tried.has(fbModel)) continue;
+      if (tried.has(fbModel) || deadClients.has(client)) continue;
       tried.add(fbModel);
       console.warn(`[llm-resolver-vessel] provider exhausted for '${model}' — falling back to '${fbModel}'`);
       const fb = await resolveWithOpenAI({ ...body, model: fbModel }, client);
       if (fb.resolved === true) return { ...fb, fallback_from: model };
-      if (tried.size >= 4) break;
+      // A billing/quota failure on one model condemns the whole client —
+      // skip its sibling models instead of burning the walk on them.
+      if (isExhaustedProviderError(fb.error) || String(fb.error ?? "").includes("402")) {
+        deadClients.add(client);
+      }
     }
   }
   return result;
