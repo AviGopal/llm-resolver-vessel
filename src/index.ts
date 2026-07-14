@@ -613,7 +613,10 @@ const isExhaustedProviderError = (e: unknown): boolean => {
     m.includes("insufficient_quota") ||
     m.includes("exceeded your current quota") ||
     m.includes("usage cap") ||
-    m.includes("402") ||
+    // 402 as a standalone status code only — a bare substring match would
+    // false-positive on token counts like "140250" and cool a healthy
+    // provider down for the whole window.
+    /(?:^|[^0-9])402(?:[^0-9]|$)/.test(m) ||
     m.includes("billing")
   );
 };
