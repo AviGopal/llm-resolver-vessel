@@ -119,6 +119,23 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
              "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free", "tencent/hy3:free"] },
 ];
 const modelClientMap = new Map<string, OpenAI>();
+
+async function llmQuotaStateHandler(_ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body: unknown }> {
+  const providers: Record<string, { present: boolean; cooldown_until_ms: number | null }> = {};
+  const allBaseURLs = [
+    OPENAI_BASE_URL ?? "https://api.openai.com/v1",
+    ...OPENAI_WIRE_PROVIDERS.map((p) => p.baseURL),
+  ];
+  for (const url of allBaseURLs) {
+    const cd = exhaustedUntil.get(url);
+    const now = Date.now();
+    providers[url] = {
+      present: cd === undefined || now >= cd,
+      cooldown_until_ms: cd !== undefined && now < cd ? cd : null,
+    };
+  }
+  return { resolved: true, shape: "llmQuotaState", body: { providers } };
+}
 let openrouterClient: OpenAI | null = null;
 for (const p of OPENAI_WIRE_PROVIDERS) {
   const key = cleanEnv(process.env[p.apiKeyEnv]);
@@ -745,13 +762,14 @@ const resolvers = new Map<string, ResolverHandler>([
   ["llm_completion", llmCompletionWithPolicyHandler],
   ["llmModelPolicy", llmModelPolicyHandler as never],
   ["llmModelPolicy_write", llmModelPolicyWriteHandler as never],
+  ["llmQuotaState", llmQuotaStateHandler as never],
 ]);
 
 const daemon = new VesselDaemon({
   port: PORT,
   vesselId: VESSEL_ID,
   vesselName: "LLM Resolver Vessel",
-  shapes: ["llm_completion", "llmCompletion", "llmModelPolicy", "llmModelPolicy_write"],
+  shapes: ["llm_completion", "llmCompletion", "llmModelPolicy", "llmModelPolicy_write", "llmQuotaState"],
   executor,
   resolvers,
   discoveryEndpoint: DISCOVERY_ENDPOINT,
