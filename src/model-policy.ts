@@ -138,6 +138,27 @@ export async function recordPendingArmOutcome(executionId: string, model: string
   await rename(tmp, PENDING_ARM_OUTCOMES_PATH);
 }
 
+export async function gradeArmByExecution(executionId: string, reached: boolean): Promise<void> {
+  let records: Array<{ executionId: string; model: string; at: string }> = [];
+  try {
+    records = JSON.parse(await readFile(PENDING_ARM_OUTCOMES_PATH, "utf-8"));
+  } catch {
+    records = [];
+  }
+  const record = records.find((r) => r.executionId === executionId);
+  if (!record) return;
+  const policy = await loadPolicy();
+  const arm = policy.arms.find((a) => a.model === record.model);
+  if (!arm) return;
+  if (reached) arm.alpha += 1; else arm.beta += 1;
+  await savePolicy(policy);
+  const updated = records.filter((r) => r.executionId !== executionId);
+  await mkdir(dirname(PENDING_ARM_OUTCOMES_PATH), { recursive: true });
+  const tmp = PENDING_ARM_OUTCOMES_PATH + ".tmp";
+  await writeFile(tmp, JSON.stringify(updated, null, 2), "utf-8");
+  await rename(tmp, PENDING_ARM_OUTCOMES_PATH);
+}
+
 export async function llmModelPolicyHandler(): Promise<{ resolved: boolean; shape: string; body: ModelPolicy }> {
   return { resolved: true, shape: "llmModelPolicy", body: await loadPolicy() };
 }
