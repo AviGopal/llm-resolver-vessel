@@ -120,6 +120,35 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
 ];
 const modelClientMap = new Map<string, OpenAI>();
 
+async function syncCompletionAdvertisement(): Promise<void> {
+  const anyAvailable =
+    (anthropic !== null && !inCooldown("anthropic")) ||
+    OPENAI_WIRE_PROVIDERS.some(
+      (p) =>
+        (modelClientMap.get(p.models[0] ?? "") ? true : false) &&
+        !inCooldown(p.baseURL)
+    );
+  try {
+    if (anyAvailable) {
+      await daemon.setShapes([
+        "llm_completion",
+        "llmCompletion",
+        "llmModelPolicy",
+        "llmModelPolicy_write",
+        "llmQuotaState",
+      ]);
+    } else {
+      await daemon.setShapes([
+        "llmModelPolicy",
+        "llmModelPolicy_write",
+        "llmQuotaState",
+      ]);
+    }
+  } catch (err) {
+    console.warn("[llm-resolver-vessel] syncCompletionAdvertisement: setShapes failed (non-fatal)", err);
+  }
+}
+
 async function llmQuotaStateHandler(_ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body: unknown }> {
   const providers: Record<string, { present: boolean; cooldown_until_ms: number | null }> = {};
   for (const p of OPENAI_WIRE_PROVIDERS) {
