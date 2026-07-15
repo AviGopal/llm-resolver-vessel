@@ -656,9 +656,13 @@ const inCooldown = (key: string): boolean => (exhaustedUntil.get(key) ?? 0) > Da
 const markExhausted = (key: string): void => {
   exhaustedUntil.set(key, Date.now() + EXHAUSTION_COOLDOWN_MS);
   console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(EXHAUSTION_COOLDOWN_MS / 1000)}s before retry`);
+  void syncCompletionAdvertisement();
 };
 const clearExhausted = (key: string): void => {
-  if (exhaustedUntil.delete(key)) console.warn(`[llm-resolver-vessel] provider '${key}' recovered — resuming preferred routing`);
+  if (exhaustedUntil.delete(key)) {
+    console.warn(`[llm-resolver-vessel] provider '${key}' recovered — resuming preferred routing`);
+    void syncCompletionAdvertisement();
+  }
 };
 const isExhaustedProviderError = (e: unknown): boolean => {
   const m = String(e ?? "").toLowerCase();
