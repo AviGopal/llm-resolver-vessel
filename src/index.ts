@@ -122,18 +122,18 @@ const modelClientMap = new Map<string, OpenAI>();
 
 async function llmQuotaStateHandler(_ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body: unknown }> {
   const providers: Record<string, { present: boolean; cooldown_until_ms: number | null }> = {};
-  const allBaseURLs = [
-    OPENAI_BASE_URL ?? "https://api.openai.com/v1",
-    ...OPENAI_WIRE_PROVIDERS.map((p) => p.baseURL),
-  ];
-  for (const url of allBaseURLs) {
-    const cd = exhaustedUntil.get(url);
-    const now = Date.now();
-    providers[url] = {
-      present: cd === undefined || now >= cd,
-      cooldown_until_ms: cd !== undefined && now < cd ? cd : null,
+  for (const p of OPENAI_WIRE_PROVIDERS) {
+    const until = exhaustedUntil.get(p.id) ?? null;
+    providers[p.id] = {
+      present: !!modelClientMap.get(p.models[0] ?? ""),
+      cooldown_until_ms: until && until > Date.now() ? until : null,
     };
   }
+  const anthropicUntil = exhaustedUntil.get("anthropic") ?? null;
+  providers["anthropic"] = {
+    present: anthropic !== null,
+    cooldown_until_ms: anthropicUntil && anthropicUntil > Date.now() ? anthropicUntil : null,
+  };
   return { resolved: true, shape: "llmQuotaState", body: { providers } };
 }
 let openrouterClient: OpenAI | null = null;
