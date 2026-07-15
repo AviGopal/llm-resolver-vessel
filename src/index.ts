@@ -123,7 +123,7 @@ const modelClientMap = new Map<string, OpenAI>();
 async function llmQuotaStateHandler(_ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body: unknown }> {
   const providers: Record<string, { present: boolean; cooldown_until_ms: number | null }> = {};
   for (const p of OPENAI_WIRE_PROVIDERS) {
-    const until = exhaustedUntil.get(p.id) ?? null;
+    const until = exhaustedUntil.get(p.baseURL) ?? null;
     providers[p.id] = {
       present: !!modelClientMap.get(p.models[0] ?? ""),
       cooldown_until_ms: until && until > Date.now() ? until : null,
