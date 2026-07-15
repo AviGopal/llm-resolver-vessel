@@ -122,6 +122,22 @@ export async function recordArmOutcome(model: string, ok: boolean): Promise<void
   await savePolicy(policy);
 }
 
+const PENDING_ARM_OUTCOMES_PATH = join(dirname(POLICY_PATH), "pending-arm-outcomes.json");
+
+export async function recordPendingArmOutcome(executionId: string, model: string): Promise<void> {
+  let records: Array<{ executionId: string; model: string; at: string }> = [];
+  try {
+    records = JSON.parse(await readFile(PENDING_ARM_OUTCOMES_PATH, "utf-8"));
+  } catch {
+    records = [];
+  }
+  records.push({ executionId, model, at: new Date().toISOString() });
+  await mkdir(dirname(PENDING_ARM_OUTCOMES_PATH), { recursive: true });
+  const tmp = PENDING_ARM_OUTCOMES_PATH + ".tmp";
+  await writeFile(tmp, JSON.stringify(records, null, 2), "utf-8");
+  await rename(tmp, PENDING_ARM_OUTCOMES_PATH);
+}
+
 export async function llmModelPolicyHandler(): Promise<{ resolved: boolean; shape: string; body: ModelPolicy }> {
   return { resolved: true, shape: "llmModelPolicy", body: await loadPolicy() };
 }
