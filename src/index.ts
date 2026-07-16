@@ -333,7 +333,9 @@ interface ToolCallTraceEntry {
 // ─────────────────────────────────────────────────────────────────────────────
 // Anthropic resolution path (existing, preserved)
 // ─────────────────────────────────────────────────────────────────────────────
-async function anthropicCreditFallback(err: unknown, body: LlmCompletionRequest): Promise<Record<string, unknown> | null> {
+async function anthropicCreditFallback(
+  err: unknown, body: LlmCompletionRequest): Promise<Record<string, unknown> | null> {
+  if (Array.isArray(body.tools) && body.tools.length > 0) return null;
   const message = err instanceof Error ? err.message : String(err);
   const status = (err as { status?: number } | null)?.status;
   const errType = (err as { error?: { type?: string; message?: string } } | null)?.error?.type;
