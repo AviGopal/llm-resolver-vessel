@@ -117,6 +117,8 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   { id: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY",
     models: ["google/gemini-2.5-flash", "openai/gpt-4o-mini", "deepseek/deepseek-chat-v3-0324",
              "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free", "tencent/hy3:free"] },
+  { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
+    models: ["gemini-2.5-flash","gemini-2.5-flash-lite","gemini-2.5-pro","gemini-3-flash-preview"] },
 ];
 const modelClientMap = new Map<string, OpenAI>();
 
