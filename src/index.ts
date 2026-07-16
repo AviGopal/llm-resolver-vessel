@@ -306,6 +306,7 @@ interface AnthropicToolDef {
 }
 
 interface LlmCompletionRequest {
+  task_type?: string;
   type: "llm_completion";
   prompt: string;
   model?: string;
@@ -771,12 +772,13 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
   const body = ctx.body as LlmCompletionRequest;
   const pinned = typeof body.model === "string" && body.model.length > 0 && body.model !== "auto";
   if (pinned) return llmCompletionHandler(ctx);
-  const sel = await selectArm();
+  const availableModels = [...[...modelClientMap.keys()].filter(m => !inCooldown(providerKeyOf(modelClientMap.get(m)!))), ...(anthropic && !inCooldown("anthropic") ? ["claude-sonnet-5","claude-haiku-4-5-20251001"] : [])];
+const sel = await selectArm(body.task_type, availableModels);
   if (!sel) return llmCompletionHandler(ctx);
   const result = await llmCompletionHandler({ ...ctx, body: { ...body, model: sel.model } } as never);
   try {
     (result as Record<string, unknown>).model_selection = sel.meta;
-    await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true);
+    await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true, body.task_type);
   } catch (err) {
     console.warn("[llm-resolver-vessel] policy outcome record failed (non-fatal):", err);
   }
