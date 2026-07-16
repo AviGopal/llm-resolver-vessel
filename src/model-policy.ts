@@ -13,8 +13,8 @@
  * immediately, and graders may write task-level outcomes via
  * llmModelPolicy_write.
  */
-import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 
 export interface PolicyArm {
   model: string;
@@ -32,7 +32,7 @@ export interface ModelPolicy {
   arms: PolicyArm[];
 }
 
-const POLICY_PATH = join(process.env.WORKSPACE_ROOT ?? "/workspace", "policies", "llm-model-policy.json");
+const POLICY_PATH = path.join(process.env.WORKSPACE_ROOT ?? "/workspace", "policies", "llm-model-policy.json");
 const CACHE_TTL_MS = 10_000;
 
 const DEFAULT_POLICY: ModelPolicy = {
@@ -54,7 +54,7 @@ export async function loadPolicy(): Promise<ModelPolicy> {
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.policy;
   let policy: ModelPolicy;
   try {
-    policy = JSON.parse(await readFile(POLICY_PATH, "utf-8")) as ModelPolicy;
+    policy = JSON.parse(await fs.readFile(POLICY_PATH, "utf-8")) as ModelPolicy;
     if (!Array.isArray(policy.arms) || policy.arms.length === 0) policy = DEFAULT_POLICY;
   } catch {
     policy = DEFAULT_POLICY;
@@ -66,10 +66,10 @@ export async function loadPolicy(): Promise<ModelPolicy> {
 
 export async function savePolicy(policy: ModelPolicy): Promise<void> {
   policy.updated_at = new Date().toISOString();
-  await mkdir(dirname(POLICY_PATH), { recursive: true });
+  await fs.mkdir(path.dirname(POLICY_PATH), { recursive: true });
   const tmp = POLICY_PATH + ".tmp";
-  await writeFile(tmp, JSON.stringify(policy, null, 2), "utf-8");
-  await rename(tmp, POLICY_PATH);
+  await fs.writeFile(tmp, JSON.stringify(policy, null, 2), "utf-8");
+  await fs.rename(tmp, POLICY_PATH);
   cached = { at: Date.now(), policy };
 }
 
@@ -136,7 +136,9 @@ export async function recordArmOutcome(model: string, ok: boolean, taskType?: st
   await savePolicy(policy);
 }
 
-const PENDING_ARM_OUTCOMES_PATH = join(dirname(POLICY_PATH), "pending-arm-outcomes.json");
+import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
+const PENDING_ARM_OUTCOMES_PATH = path.join(path.dirname(POLICY_PATH), "pending-arm-outcomes.json");
 
 export async function recordPendingArmOutcome(executionId: string, model: string): Promise<void> {
   let records: Array<{ executionId: string; model: string; at: string }> = [];
