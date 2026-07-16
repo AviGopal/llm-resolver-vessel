@@ -69,7 +69,7 @@ const RETIRED_ANTHROPIC_MODEL_IDS = new Set(["claude-sonnet-4-20250514"]);
 const OPENAI_MODEL_PREFIXES = [
   "gpt-", "o1-", "o3-", "o4-",
   "llama", "mistral", "mixtral", "gemma", "phi-",
-  "qwen", "deepseek", "yi-", "command-", "nova-",
+  "qwen", "deepseek", "yi-", "command-", "nova-", "qwenvn",
   "whisper-", "tts-", "dall-e-",
 ];
 
