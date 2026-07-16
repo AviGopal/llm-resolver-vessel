@@ -136,6 +136,14 @@ export async function recordArmOutcome(model: string, ok: boolean, taskType?: st
   await savePolicy(policy);
 }
 
+export function providerFor(modelId: string): string {
+  if (modelId.startsWith("claude")) return "anthropic";
+  if (modelId.startsWith("gemini")) return "google";
+  if (modelId.endsWith("-TEE")) return "chutes";
+  if (modelId.includes("/")) return "openrouter";
+  return "unknown";
+}
+
 import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 const PENDING_ARM_OUTCOMES_PATH = path.join(path.dirname(POLICY_PATH), "pending-arm-outcomes.json");
