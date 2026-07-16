@@ -22,6 +22,8 @@ export interface PolicyArm {
   alpha: number;
   beta: number;
   note?: string;
+  task_alpha?: Record<string, number>;
+  task_beta?: Record<string, number>;
 }
 export interface ModelPolicy {
   rev: number;
@@ -87,16 +89,19 @@ export interface ArmSelection {
   meta: Record<string, unknown>;
 }
 
-export async function selectArm(): Promise<ArmSelection | null> {
+export async function selectArm(taskType?: string, availableModels?: string[]): Promise<ArmSelection | null> {
   const policy = await loadPolicy();
   if (policy.arms.length === 0) return null;
   const maxCost = Math.max(...policy.arms.map((a) => a.cost_per_mtok), 0.01);
   let best: { arm: PolicyArm; score: number } | null = null;
   const considered: Array<Record<string, unknown>> = [];
   for (const arm of policy.arms) {
-    const draw = betaSample(arm.alpha, arm.beta);
+    if (availableModels && !availableModels.includes(arm.model)) continue;
+    const taskAlpha = taskType && arm.task_alpha && arm.task_alpha[taskType] !== undefined ? arm.task_alpha[taskType]! : arm.alpha;
+    const taskBeta = taskType && arm.task_beta && arm.task_beta[taskType] !== undefined ? arm.task_beta[taskType]! : arm.beta;
+    const draw = betaSample(taskAlpha, taskBeta);
     const score = draw - policy.cost_weight * (arm.cost_per_mtok / maxCost);
-    considered.push({ model: arm.model, draw: Number(draw.toFixed(4)), score: Number(score.toFixed(4)), alpha: arm.alpha, beta: arm.beta, cost_per_mtok: arm.cost_per_mtok });
+    considered.push({ model: arm.model, draw: Number(draw.toFixed(4)), score: Number(score.toFixed(4)), alpha: taskAlpha, beta: taskBeta, cost_per_mtok: arm.cost_per_mtok });
     if (!best || score > best.score) best = { arm, score };
   }
   if (!best) return null;
@@ -114,11 +119,20 @@ export async function selectArm(): Promise<ArmSelection | null> {
 /** Technical-outcome update for an auto-selected arm. Only policy-chosen calls
  * are graded here (causal discipline: never grade pinned calls the policy did
  * not choose). Task-level verdicts arrive via llmModelPolicy_write. */
-export async function recordArmOutcome(model: string, ok: boolean): Promise<void> {
+export async function recordArmOutcome(model: string, ok: boolean, taskType?: string): Promise<void> {
   const policy = await loadPolicy();
   const arm = policy.arms.find((a) => a.model === model);
   if (!arm) return;
-  if (ok) arm.alpha += 1; else arm.beta += 1;
+  if (taskType) {
+    arm.task_alpha = arm.task_alpha ?? {};
+    arm.task_beta = arm.task_beta ?? {};
+    const a = (arm.task_alpha[taskType] ?? arm.alpha) + (ok ? 1 : 0);
+    const b = (arm.task_beta[taskType] ?? arm.beta) + (ok ? 0 : 1);
+    arm.task_alpha[taskType] = a;
+    arm.task_beta[taskType] = b;
+  } else {
+    if (ok) arm.alpha += 1; else arm.beta += 1;
+  }
   await savePolicy(policy);
 }
 
@@ -138,7 +152,24 @@ export async function recordPendingArmOutcome(executionId: string, model: string
   await rename(tmp, PENDING_ARM_OUTCOMES_PATH);
 }
 
-export async function gradeArmByExecution(executionId: string, reached: boolean): Promise<void> {
+export async function gradeArmByExecution(executionId: string, reached: boolean, taskType?: string): Promise<void> {
+  let records: Array<{ executionId: string; model: string; at: string }> = [];
+  try {
+    records = JSON.parse(await readFile(PENDING_ARM_OUTCOMES_PATH, "utf-8"));
+  } catch {
+    records = [];
+  }
+  const record = records.find((r) => r.executionId === executionId);
+  if (!record) return;
+  records = records.filter((r) => r.executionId !== executionId);
+  await mkdir(dirname(PENDING_ARM_OUTCOMES_PATH), { recursive: true });
+  const tmp = PENDING_ARM_OUTCOMES_PATH + ".tmp";
+  await writeFile(tmp, JSON.stringify(records, null, 2), "utf-8");
+  await rename(tmp, PENDING_ARM_OUTCOMES_PATH);
+  await recordArmOutcome(record.model, reached, taskType);
+}
+
+export async function recordArmOutcomeFromPending(executionId: string, reached: boolean): Promise<void> {
   let records: Array<{ executionId: string; model: string; at: string }> = [];
   try {
     records = JSON.parse(await readFile(PENDING_ARM_OUTCOMES_PATH, "utf-8"));
