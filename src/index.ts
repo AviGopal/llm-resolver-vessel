@@ -123,29 +123,22 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
 const modelClientMap = new Map<string, OpenAI>();
 
 async function syncCompletionAdvertisement(): Promise<void> {
-  const anyAvailable =
-    (anthropic !== null && !inCooldown("anthropic")) ||
-    OPENAI_WIRE_PROVIDERS.some(
-      (p) =>
-        (modelClientMap.get(p.models[0] ?? "") ? true : false) &&
-        !inCooldown(p.baseURL)
-    );
+  // Never un-advertise llm_completion. Un-advertising on exhaustion severs the
+  // very traffic whose success would clear the cooldown, and nothing re-runs
+  // this sync on cooldown expiry — so one all-providers-cooling moment removes
+  // the completion plane from discovery permanently (advertisement-shrink
+  // deadlock). Worse, cooldowns are provider-granular: a 402 on a paid
+  // openrouter model hides the working :free models on the same baseURL.
+  // Exhaustion stays observable through the llmQuotaState shape and through
+  // per-request structured errors, which callers already cascade on.
   try {
-    if (anyAvailable) {
-      await daemon.setShapes([
-        "llm_completion",
-        "llmCompletion",
-        "llmModelPolicy",
-        "llmModelPolicy_write",
-        "llmQuotaState",
-      ]);
-    } else {
-      await daemon.setShapes([
-        "llmModelPolicy",
-        "llmModelPolicy_write",
-        "llmQuotaState",
-      ]);
-    }
+    await daemon.setShapes([
+      "llm_completion",
+      "llmCompletion",
+      "llmModelPolicy",
+      "llmModelPolicy_write",
+      "llmQuotaState",
+    ]);
   } catch (err) {
     console.warn("[llm-resolver-vessel] syncCompletionAdvertisement: setShapes failed (non-fatal)", err);
   }
