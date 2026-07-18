@@ -673,7 +673,10 @@ const isExhaustedProviderError = (e: unknown): boolean => {
     // false-positive on token counts like "140250" and cool a healthy
     // provider down for the whole window.
     /(?:^|[^0-9])402(?:[^0-9]|$)/.test(m) ||
-    m.includes("billing")
+    m.includes("billing") ||
+    m.includes("limit_rpd") ||
+    m.includes("limit_rpm") ||
+    m.includes("daily limit reached")
   );
 };
 
