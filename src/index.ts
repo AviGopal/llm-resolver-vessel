@@ -677,6 +677,38 @@ const isExhaustedProviderError = (e: unknown): boolean => {
   );
 };
 
+// Model-granular exhaustion. Provider-level cooldowns condemn every model on a
+// baseURL when one 402s — which hid the working :free openrouter models behind
+// a paid-model 402 (2026-07-18 completion-plane outage). Cool down the failing
+// MODEL; siblings on the same client stay eligible.
+const modelExhaustedUntil = new Map<string, number>();
+const inModelCooldown = (m: string): boolean => (modelExhaustedUntil.get(m) ?? 0) > Date.now();
+const markModelExhausted = (m: string): void => {
+  modelExhaustedUntil.set(m, Date.now() + EXHAUSTION_COOLDOWN_MS);
+  console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(EXHAUSTION_COOLDOWN_MS / 1000)}s`);
+};
+
+// Shared billing-exhaustion fallback: walk every keyed wire model not in its
+// own cooldown, in registry order (paid tiers first, :free last resort).
+const walkFallbackModels = async (
+  body: LlmCompletionRequest,
+  fromModel: string,
+): Promise<Record<string, unknown> | null> => {
+  const tried = new Set<string>([fromModel]);
+  for (const [fbModel, client] of modelClientMap) {
+    if (tried.has(fbModel) || inModelCooldown(fbModel)) continue;
+    tried.add(fbModel);
+    console.warn(`[llm-resolver-vessel] provider exhausted for '${fromModel}' — falling back to '${fbModel}'`);
+    const fb = await resolveWithOpenAI({ ...body, model: fbModel }, client);
+    if (fb.resolved === true) {
+      clearExhausted(providerKeyOf(client));
+      return { ...fb, fallback_from: fromModel };
+    }
+    if (isExhaustedProviderError(fb.error)) markModelExhausted(fbModel);
+  }
+  return null;
+};
+
 const llmCompletionHandler: ResolverHandler = async (ctx) => {
   const body = ctx.body as LlmCompletionRequest;
 
@@ -686,10 +718,24 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
 
   const model = body.model ?? DEFAULT_MODEL;
   const wireClient = modelClientMap.get(model);
-  if (wireClient) return resolveWithOpenAI(body, wireClient);
+  if (wireClient) {
+    if (inModelCooldown(model)) {
+      const walked = await walkFallbackModels(body, model);
+      if (walked) return walked;
+    }
+    const r = await resolveWithOpenAI(body, wireClient);
+    if (r.resolved === true || !isExhaustedProviderError(r.error)) return r;
+    markModelExhausted(model);
+    const walked = await walkFallbackModels(body, model);
+    return walked ?? r;
+  }
   // Any vendor/model id not explicitly mapped routes through OpenRouter when keyed.
   if (openrouterClient && model.includes("/") && !model.toLowerCase().startsWith("anthropic/")) {
-    return resolveWithOpenAI(body, openrouterClient);
+    const r = await resolveWithOpenAI(body, openrouterClient);
+    if (r.resolved === true || !isExhaustedProviderError(r.error)) return r;
+    markModelExhausted(model);
+    const walked = await walkFallbackModels(body, model);
+    return walked ?? r;
   }
   const provider = pickProvider(model, body.provider);
 
@@ -723,25 +769,8 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
     }
   }
   if (result.resolved !== true && (primaryCoolingDown || isExhaustedProviderError(result.error))) {
-    const tried = new Set<string>([model]);
-    const deadClients = new Set<OpenAI>();
-    for (const [fbModel, client] of modelClientMap) {
-      const key = providerKeyOf(client);
-      if (tried.has(fbModel) || deadClients.has(client) || inCooldown(key)) continue;
-      tried.add(fbModel);
-      console.warn(`[llm-resolver-vessel] provider exhausted for '${model}' — falling back to '${fbModel}'`);
-      const fb = await resolveWithOpenAI({ ...body, model: fbModel }, client);
-      if (fb.resolved === true) {
-        clearExhausted(key);
-        return { ...fb, fallback_from: model };
-      }
-      // A billing/quota failure on one model condemns the whole client for a
-      // cooldown window — skip its sibling models and remember across requests.
-      if (isExhaustedProviderError(fb.error)) {
-        deadClients.add(client);
-        markExhausted(key);
-      }
-    }
+    const walked = await walkFallbackModels(body, model);
+    if (walked) return walked;
     // Last resort: every fallback lane is dead or cooling down — try the
     // primary anyway even mid-cooldown (its balance may have just returned).
     if (primaryCoolingDown) {
@@ -769,7 +798,7 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
   const body = ctx.body as LlmCompletionRequest;
   const pinned = typeof body.model === "string" && body.model.length > 0 && body.model !== "auto";
   if (pinned) return llmCompletionHandler(ctx);
-  const availableModels = [...[...modelClientMap.keys()].filter(m => !inCooldown(providerKeyOf(modelClientMap.get(m)!))), ...(anthropic && !inCooldown("anthropic") ? ["claude-sonnet-5","claude-haiku-4-5-20251001"] : [])];
+  const availableModels = [...[...modelClientMap.keys()].filter(m => !inModelCooldown(m)), ...(anthropic && !inCooldown("anthropic") ? ["claude-sonnet-5","claude-haiku-4-5-20251001"] : [])];
 const sel = await selectArm(body.task_type, availableModels);
   if (!sel) return llmCompletionHandler(ctx);
   const result = await llmCompletionHandler({ ...ctx, body: { ...body, model: sel.model } } as never);
