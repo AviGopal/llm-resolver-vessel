@@ -680,7 +680,13 @@ const isExhaustedProviderError = (e: unknown): boolean => {
     m.includes("billing") ||
     m.includes("limit_rpd") ||
     m.includes("limit_rpm") ||
-    m.includes("daily limit reached")
+    m.includes("daily limit reached") ||
+    m.includes("rate limit") ||
+    m.includes("too many requests") ||
+    m.includes("free-models-per-day") ||
+    // 429 as a standalone status code only (regex-guarded like 402 above so a
+    // token count like "14290" cannot false-positive a healthy provider).
+    /(?:^|[^0-9])429(?:[^0-9]|$)/.test(m)
   );
 };
 
