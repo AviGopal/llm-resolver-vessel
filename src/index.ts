@@ -127,22 +127,32 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
 const modelClientMap = new Map<string, OpenAI>();
 
 async function syncCompletionAdvertisement(): Promise<void> {
-  // Never un-advertise llm_completion. Un-advertising on exhaustion severs the
-  // very traffic whose success would clear the cooldown, and nothing re-runs
-  // this sync on cooldown expiry — so one all-providers-cooling moment removes
-  // the completion plane from discovery permanently (advertisement-shrink
-  // deadlock). Worse, cooldowns are provider-granular: a 402 on a paid
-  // openrouter model hides the working :free models on the same baseURL.
-  // Exhaustion stays observable through the llmQuotaState shape and through
-  // per-request structured errors, which callers already cascade on.
+  // Quota-gated advertisement (law: a resolver must not advertise a shape it
+  // cannot serve). When every keyed wire model AND the anthropic/openai lanes
+  // are in exhaustion cooldown, DROP the completion-serving shapes so discovery
+  // routes callers to a producer that still has quota (incl. a remote hub arm)
+  // instead of into a dead local arm. The observability/policy shapes stay
+  // advertised: llmQuotaState keeps exhaustion visible and llmModelPolicy stays
+  // writable regardless of quota.
+  //
+  // Per-MODEL cooldown means a paid 402 never hides the working :free siblings
+  // on the same baseURL — as long as ANY model (paid or :free) is uncooled,
+  // hasCompletionQuota() is true and completion stays advertised.
+  //
+  // Resume is condition-driven, not traffic-driven: a dropped shape receives no
+  // completion traffic, so nothing would arrive to clear a passively-expiring
+  // cooldown (the advertisement-shrink deadlock). markExhausted /
+  // markModelExhausted schedule a re-sync at cooldown expiry via
+  // scheduleAdvertisementResume(), and a recovering provider re-syncs on the
+  // success path (clearExhausted).
+  const shapes = ["llmModelPolicy", "llmModelPolicy_write", "llmQuotaState"];
+  if (hasCompletionQuota()) {
+    shapes.unshift("llm_completion", "llmCompletion");
+  } else {
+    console.warn("[llm-resolver-vessel] all completion providers cooling — de-advertising llm_completion until quota returns");
+  }
   try {
-    await daemon.setShapes([
-      "llm_completion",
-      "llmCompletion",
-      "llmModelPolicy",
-      "llmModelPolicy_write",
-      "llmQuotaState",
-    ]);
+    await daemon.setShapes(shapes);
   } catch (err) {
     console.warn("[llm-resolver-vessel] syncCompletionAdvertisement: setShapes failed (non-fatal)", err);
   }
@@ -659,6 +669,7 @@ const markExhausted = (key: string): void => {
   exhaustedUntil.set(key, Date.now() + EXHAUSTION_COOLDOWN_MS);
   console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(EXHAUSTION_COOLDOWN_MS / 1000)}s before retry`);
   void syncCompletionAdvertisement();
+  scheduleAdvertisementResume();
 };
 const clearExhausted = (key: string): void => {
   if (exhaustedUntil.delete(key)) {
@@ -696,9 +707,36 @@ const isExhaustedProviderError = (e: unknown): boolean => {
 // MODEL; siblings on the same client stay eligible.
 const modelExhaustedUntil = new Map<string, number>();
 const inModelCooldown = (m: string): boolean => (modelExhaustedUntil.get(m) ?? 0) > Date.now();
+
+// Quota gate for advertisement: any uncooled keyed wire model, or the
+// anthropic/openai lanes still outside cooldown, means completion is servable.
+// Mirrors the availableModels expression used for policy arm selection
+// (llmCompletionWithPolicyHandler) so the advertised set and the routable set
+// never disagree — and it is model-granular, so :free siblings keep the shape
+// advertised even when a paid model on the same baseURL is cooling.
+const hasCompletionQuota = (): boolean =>
+  [...modelClientMap.keys()].some((m) => !inModelCooldown(m)) ||
+  (anthropic !== null && !inCooldown("anthropic")) ||
+  (openaiClient !== null && !inCooldown("openai"));
+
+// Condition-driven resume of a de-advertised completion plane. A dropped shape
+// receives no traffic, so nothing would ever clear a passively-expiring model
+// cooldown — re-run the advertisement sync once the exhaustion window lapses.
+// One pending timer at a time; unref so it never holds the process open.
+let advertisementResumeTimer: ReturnType<typeof setTimeout> | null = null;
+const scheduleAdvertisementResume = (): void => {
+  if (advertisementResumeTimer !== null) return;
+  advertisementResumeTimer = setTimeout(() => {
+    advertisementResumeTimer = null;
+    void syncCompletionAdvertisement();
+  }, EXHAUSTION_COOLDOWN_MS + 1000);
+  (advertisementResumeTimer as { unref?: () => void }).unref?.();
+};
 const markModelExhausted = (m: string): void => {
   modelExhaustedUntil.set(m, Date.now() + EXHAUSTION_COOLDOWN_MS);
   console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(EXHAUSTION_COOLDOWN_MS / 1000)}s`);
+  void syncCompletionAdvertisement();
+  scheduleAdvertisementResume();
 };
 
 // Shared billing-exhaustion fallback: walk every keyed wire model not in its
