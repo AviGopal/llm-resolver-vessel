@@ -697,7 +697,20 @@ const isExhaustedProviderError = (e: unknown): boolean => {
     m.includes("free-models-per-day") ||
     // 429 as a standalone status code only (regex-guarded like 402 above so a
     // token count like "14290" cannot false-positive a healthy provider).
-    /(?:^|[^0-9])429(?:[^0-9]|$)/.test(m)
+    /(?:^|[^0-9])429(?:[^0-9]|$)/.test(m) ||
+    // A "free" model that 404s with "unavailable for free / use the paid slug /
+    // no endpoints" (openrouter free-tier drift) is dead to US — cool the MODEL
+    // so the failover walk fires and the quota-gate de-advertises the arm,
+    // instead of sinking the dispatch in ~30ms and keeping a dead arm falsely
+    // advertised (which strands a spoke on its dead local arm instead of routing
+    // through discovery to a quota-having producer). Narrowed to a standalone 404
+    // AND a paid/unavailable phrase so a genuine wrong-model 404 on a healthy
+    // provider does not cool the whole lane.
+    (/(?:^|[^0-9])404(?:[^0-9]|$)/.test(m) &&
+      (m.includes("unavailable") ||
+        m.includes("paid") ||
+        m.includes("use this slug") ||
+        m.includes("no endpoints")))
   );
 };
 
