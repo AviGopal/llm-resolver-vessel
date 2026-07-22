@@ -861,7 +861,20 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
 const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
   const body = ctx.body as LlmCompletionRequest;
   const pinned = typeof body.model === "string" && body.model.length > 0 && body.model !== "auto";
-  if (pinned) return llmCompletionHandler(ctx);
+  if (pinned) {
+    // A model pin is a PREFERENCE, not a mandate. Model/tier is learned shaped selection
+    // reading live quota — a hardcoded model must never STRAND the plane on a credit-dry
+    // provider when another arm has quota. Honor the pin only when its arm is actually
+    // servable; otherwise fall through to policy-selection over the arms that DO have quota
+    // (and, when none do locally, to the de-advertise path so discovery routes to a peer
+    // that can serve). This neutralises every hardcoded caller pin at the choke point.
+    const pm = body.model as string;
+    const wireLive = modelClientMap.has(pm) && !inModelCooldown(pm);
+    const prov = pickProvider(pm, body.provider);
+    const provLive = prov !== null && !inCooldown(prov);
+    if (wireLive || provLive) return llmCompletionHandler(ctx);
+    // pinned arm is dry → drop the pin and select a live arm by policy below.
+  }
   const availableModels = [...[...modelClientMap.keys()].filter(m => !inModelCooldown(m)), ...(anthropic && !inCooldown("anthropic") ? ["claude-sonnet-5","claude-haiku-4-5-20251001"] : [])];
 const sel = await selectArm(body.task_type, availableModels);
   if (!sel) return llmCompletionHandler(ctx);
