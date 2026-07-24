@@ -136,6 +136,28 @@ export async function recordArmOutcome(model: string, ok: boolean, taskType?: st
   await savePolicy(policy);
 }
 
+/** Idempotently ensure a policy arm exists for each model (used to register
+ * self-hosted vLLM models discovered from env at startup, so the Thompson
+ * selector can pick them in auto mode). Existing arms are left untouched — their
+ * learned alpha/beta and any operator-tuned cost survive restarts. Self-hosted
+ * inference has no per-token vendor price, so new arms seed at cost 0, which
+ * makes the cost-discount term favour them until reach evidence says otherwise. */
+export async function ensureArmsForModels(models: string[], costPerMtok = 0, note = "self-hosted vLLM"): Promise<number> {
+  if (models.length === 0) return 0;
+  const policy = await loadPolicy();
+  let added = 0;
+  for (const model of models) {
+    if (policy.arms.some((a) => a.model === model)) continue;
+    policy.arms.push({ model, cost_per_mtok: costPerMtok, alpha: 1, beta: 1, note });
+    added += 1;
+  }
+  if (added > 0) {
+    policy.rev += 1;
+    await savePolicy(policy);
+  }
+  return added;
+}
+
 export function providerFor(modelId: string): string {
   if (modelId.startsWith("claude")) return "anthropic";
   if (modelId.startsWith("gemini")) return "google";

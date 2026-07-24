@@ -36,7 +36,7 @@ import {
   VesselDaemon,
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
-import { selectArm, recordArmOutcome, llmModelPolicyHandler, llmModelPolicyWriteHandler } from "./model-policy.js";
+import { selectArm, recordArmOutcome, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels } from "./model-policy.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -98,7 +98,9 @@ if (OPENAI_API_KEY) {
 }
 
 // OpenAI-wire-compatible provider registry: add a service as data, not a new code path.
-interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; models: string[]; }
+// defaultKey lets a keyless self-hosted endpoint (vLLM with no --api-key) still
+// construct an OpenAI client, which requires a non-empty apiKey string.
+interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; models: string[]; defaultKey?: string; }
 const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   { id: "chutes", baseURL: "https://llm.chutes.ai/v1", apiKeyEnv: "CHUTES_API_KEY",
     models: ["zai-org/GLM-5.1-TEE", "zai-org/GLM-5.2-TEE", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"] },
@@ -124,6 +126,58 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   { id: "mistral", baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY",
     models: ["mistral-small-latest", "codestral-latest", "mistral-large-latest"] },
 ];
+
+// Self-hosted vLLM endpoints (Vast.ai / RunPod behind a Cloudflare Tunnel) are
+// operator/deploy-specific: the baseURL is a per-instance stable hostname, not a
+// fixed vendor URL, so they are injected via env rather than hardcoded here. Two
+// forms (both may be set; VLLM_ENDPOINTS entries come first):
+//   VLLM_ENDPOINTS  = JSON array [{id, baseURL, models, apiKeyEnv?}]   (multi-instance)
+//   VLLM_BASE_URL + VLLM_MODELS (+ optional VLLM_API_KEY)              (single instance)
+// Once appended, these behave as any other OpenAI-wire provider — modelClientMap,
+// the exhaustion failover walk, quota-gated advertisement all apply unchanged.
+// vLLM served-model ids come from the instance's MODEL / SERVED_MODEL_NAME; list
+// exactly those here so callers can pin them and the policy can select them.
+function loadSelfHostedVllmProviders(): OpenAiWireProvider[] {
+  const out: OpenAiWireProvider[] = [];
+  const splitModels = (s: string): string[] => s.split(",").map((m) => m.trim()).filter(Boolean);
+
+  const endpointsRaw = cleanEnv(process.env.VLLM_ENDPOINTS);
+  if (endpointsRaw) {
+    try {
+      const parsed = JSON.parse(endpointsRaw) as Array<{ id?: string; baseURL?: string; models?: string[] | string; apiKeyEnv?: string }>;
+      for (const [i, e] of parsed.entries()) {
+        const baseURL = cleanEnv(e.baseURL);
+        const models = Array.isArray(e.models) ? e.models : splitModels(e.models ?? "");
+        if (!baseURL || models.length === 0) {
+          console.warn(`[llm-resolver-vessel] VLLM_ENDPOINTS[${i}] missing baseURL or models — skipping`);
+          continue;
+        }
+        out.push({ id: cleanEnv(e.id) ?? `vllm-${i}`, baseURL, models, apiKeyEnv: e.apiKeyEnv ?? "VLLM_API_KEY", defaultKey: "EMPTY" });
+      }
+    } catch (err) {
+      console.warn("[llm-resolver-vessel] VLLM_ENDPOINTS is not valid JSON — ignoring", err);
+    }
+  }
+
+  const singleBase = cleanEnv(process.env.VLLM_BASE_URL);
+  if (singleBase) {
+    const models = splitModels(cleanEnv(process.env.VLLM_MODELS) ?? "");
+    if (models.length === 0) {
+      console.warn("[llm-resolver-vessel] VLLM_BASE_URL set but VLLM_MODELS empty — skipping single vLLM endpoint");
+    } else {
+      out.push({ id: cleanEnv(process.env.VLLM_ID) ?? "vllm", baseURL: singleBase, models, apiKeyEnv: "VLLM_API_KEY", defaultKey: "EMPTY" });
+    }
+  }
+  return out;
+}
+
+const SELF_HOSTED_VLLM_PROVIDERS = loadSelfHostedVllmProviders();
+for (const p of SELF_HOSTED_VLLM_PROVIDERS) {
+  OPENAI_WIRE_PROVIDERS.push(p);
+  console.log(`[llm-resolver-vessel] self-hosted vLLM provider '${p.id}': ${p.baseURL} (${p.models.length} models)`);
+}
+const SELF_HOSTED_VLLM_MODELS = [...new Set(SELF_HOSTED_VLLM_PROVIDERS.flatMap((p) => p.models))];
+
 const modelClientMap = new Map<string, OpenAI>();
 
 async function syncCompletionAdvertisement(): Promise<void> {
@@ -176,7 +230,9 @@ async function llmQuotaStateHandler(_ctx: { body: unknown }): Promise<{ resolved
 }
 let openrouterClient: OpenAI | null = null;
 for (const p of OPENAI_WIRE_PROVIDERS) {
-  const key = cleanEnv(process.env[p.apiKeyEnv]);
+  // Self-hosted endpoints (defaultKey set) stay eligible even when their key env
+  // is absent — a keyless vLLM ignores the token but the SDK needs a non-empty one.
+  const key = cleanEnv(process.env[p.apiKeyEnv]) ?? p.defaultKey;
   if (!key) continue;
   const client = new OpenAI({ apiKey: key, baseURL: p.baseURL });
   for (const m of p.models) modelClientMap.set(m, client);
@@ -662,14 +718,34 @@ const EXHAUSTION_COOLDOWN_MS =
   Number.parseInt(process.env.LLM_EXHAUSTION_COOLDOWN_MS ?? "", 10) > 0
     ? Number.parseInt(process.env.LLM_EXHAUSTION_COOLDOWN_MS ?? "", 10)
     : 10 * 60 * 1000;
+// Reachability failures (self-hosted spot instance down, gateway 5xx, DNS/TCP
+// error) get a much SHORTER cooldown than billing exhaustion: a flapping Vast/
+// RunPod endpoint should return to rotation in seconds once it's back, not sit
+// out the full 10-minute credit-outage window.
+const UNREACHABLE_COOLDOWN_MS =
+  Number.parseInt(process.env.LLM_UNREACHABLE_COOLDOWN_MS ?? "", 10) > 0
+    ? Number.parseInt(process.env.LLM_UNREACHABLE_COOLDOWN_MS ?? "", 10)
+    : 30 * 1000;
+// Transient rate-limits (429 / RPM / provider "overloaded") are NOT credit
+// exhaustion: they clear in seconds. Under a thundering herd — a freshly-resumed
+// arm taking the whole fleet's pent-up demand at once — every provider 429s, and
+// giving those the 10-minute EXHAUSTION cooldown darkens the local arm for 10
+// minutes per stampede (the observed flapping: it re-advertised, was swamped,
+// re-exhausted its entire stack in ~4s, and went dark again). A short rate-limit
+// cooldown lets it rejoin rotation in under a minute so the demand spreads across
+// arms instead of collapsing onto the single funded hub producer.
+const RATE_LIMIT_COOLDOWN_MS =
+  Number.parseInt(process.env.LLM_RATE_LIMIT_COOLDOWN_MS ?? "", 10) > 0
+    ? Number.parseInt(process.env.LLM_RATE_LIMIT_COOLDOWN_MS ?? "", 10)
+    : 45 * 1000;
 const exhaustedUntil = new Map<string, number>();
 const providerKeyOf = (client: OpenAI): string => String((client as { baseURL?: unknown }).baseURL ?? "openai-wire");
 const inCooldown = (key: string): boolean => (exhaustedUntil.get(key) ?? 0) > Date.now();
-const markExhausted = (key: string): void => {
-  exhaustedUntil.set(key, Date.now() + EXHAUSTION_COOLDOWN_MS);
-  console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(EXHAUSTION_COOLDOWN_MS / 1000)}s before retry`);
+const markExhausted = (key: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
+  exhaustedUntil.set(key, Date.now() + ms);
+  console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(ms / 1000)}s before retry`);
   void syncCompletionAdvertisement();
-  scheduleAdvertisementResume();
+  scheduleAdvertisementResume(ms);
 };
 const clearExhausted = (key: string): void => {
   if (exhaustedUntil.delete(key)) {
@@ -714,6 +790,76 @@ const isExhaustedProviderError = (e: unknown): boolean => {
   );
 };
 
+// Reachability failures — distinct from billing exhaustion. A self-hosted vLLM
+// instance on a spot marketplace is frequently down/restarting, so a TCP/DNS
+// error, gateway 5xx, or SDK "Connection error" must trigger the SAME failover
+// walk (don't hard-error to the caller when another arm can serve) but with a
+// short cooldown so the endpoint rejoins rotation quickly once it's back.
+const isUnreachableProviderError = (e: unknown): boolean => {
+  const m = String(e ?? "").toLowerCase();
+  return (
+    m.includes("fetch failed") ||
+    m.includes("connection error") ||
+    m.includes("econnrefused") ||
+    m.includes("econnreset") ||
+    m.includes("etimedout") ||
+    m.includes("enotfound") ||
+    m.includes("eai_again") ||
+    m.includes("socket hang up") ||
+    m.includes("network error") ||
+    m.includes("request timed out") ||
+    m.includes("terminated") ||
+    // Gateway/edge unavailability (Cloudflare Tunnel origin down, vLLM loading
+    // weights) — standalone status codes only, regex-guarded so a token count
+    // like "50231" cannot false-positive.
+    /(?:^|[^0-9])(?:502|503|504)(?:[^0-9]|$)/.test(m)
+  );
+};
+
+// A failover-worthy error is either kind; the cooldown length depends on which.
+const isFailoverError = (e: unknown): boolean => isExhaustedProviderError(e) || isUnreachableProviderError(e);
+// HARD exhaustion — a genuinely dead lane (no credit, quota gone, daily cap hit).
+// These deserve the full EXHAUSTION cooldown: retrying sooner just re-fails. This
+// is the credit/quota subset of isExhaustedProviderError, WITHOUT the transient
+// per-request rate-limits (which the same fn also matches so failover still fires).
+const isHardExhaustedError = (e: unknown): boolean => {
+  const m = String(e ?? "").toLowerCase();
+  return (
+    m.includes("credit balance") ||
+    m.includes("insufficient_quota") ||
+    m.includes("exceeded your current quota") ||
+    m.includes("usage cap") ||
+    /(?:^|[^0-9])402(?:[^0-9]|$)/.test(m) ||
+    m.includes("billing") ||
+    m.includes("limit_rpd") ||
+    m.includes("daily limit reached") ||
+    m.includes("free-models-per-day")
+  );
+};
+// Transient rate-limit — recovers in seconds. Distinct from a daily/credit cap.
+const isRateLimitError = (e: unknown): boolean => {
+  if (isHardExhaustedError(e)) return false;
+  const m = String(e ?? "").toLowerCase();
+  return (
+    m.includes("limit_rpm") ||
+    m.includes("rate limit") ||
+    m.includes("rate_limit") ||
+    m.includes("too many requests") ||
+    m.includes("overloaded") ||
+    /(?:^|[^0-9])429(?:[^0-9]|$)/.test(m) ||
+    /(?:^|[^0-9])529(?:[^0-9]|$)/.test(m)
+  );
+};
+// Grade the cooldown by cause: hard exhaustion → full window; transient
+// rate-limit → short; reachability blip → shortest. A cause that matches none of
+// these (unexpected error) defaults conservative (full window).
+const cooldownMsFor = (e: unknown): number => {
+  if (isHardExhaustedError(e)) return EXHAUSTION_COOLDOWN_MS;
+  if (isRateLimitError(e)) return RATE_LIMIT_COOLDOWN_MS;
+  if (isUnreachableProviderError(e)) return UNREACHABLE_COOLDOWN_MS;
+  return EXHAUSTION_COOLDOWN_MS;
+};
+
 // Model-granular exhaustion. Provider-level cooldowns condemn every model on a
 // baseURL when one 402s — which hid the working :free openrouter models behind
 // a paid-model 402 (2026-07-18 completion-plane outage). Cool down the failing
@@ -737,19 +883,26 @@ const hasCompletionQuota = (): boolean =>
 // cooldown — re-run the advertisement sync once the exhaustion window lapses.
 // One pending timer at a time; unref so it never holds the process open.
 let advertisementResumeTimer: ReturnType<typeof setTimeout> | null = null;
-const scheduleAdvertisementResume = (): void => {
-  if (advertisementResumeTimer !== null) return;
+let advertisementResumeAt = 0;
+const scheduleAdvertisementResume = (ms: number = EXHAUSTION_COOLDOWN_MS): void => {
+  const fireAt = Date.now() + ms + 1000;
+  // Keep the soonest pending resume: a short reachability cooldown must not be
+  // shadowed by an earlier-scheduled long exhaustion window (else a recovered
+  // spot endpoint stays de-advertised for the full 10 minutes).
+  if (advertisementResumeTimer !== null && fireAt >= advertisementResumeAt) return;
+  if (advertisementResumeTimer !== null) clearTimeout(advertisementResumeTimer);
+  advertisementResumeAt = fireAt;
   advertisementResumeTimer = setTimeout(() => {
     advertisementResumeTimer = null;
     void syncCompletionAdvertisement();
-  }, EXHAUSTION_COOLDOWN_MS + 1000);
+  }, ms + 1000);
   (advertisementResumeTimer as { unref?: () => void }).unref?.();
 };
-const markModelExhausted = (m: string): void => {
-  modelExhaustedUntil.set(m, Date.now() + EXHAUSTION_COOLDOWN_MS);
-  console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(EXHAUSTION_COOLDOWN_MS / 1000)}s`);
+const markModelExhausted = (m: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
+  modelExhaustedUntil.set(m, Date.now() + ms);
+  console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(ms / 1000)}s`);
   void syncCompletionAdvertisement();
-  scheduleAdvertisementResume();
+  scheduleAdvertisementResume(ms);
 };
 
 // Shared billing-exhaustion fallback: walk every keyed wire model not in its
@@ -768,7 +921,7 @@ const walkFallbackModels = async (
       clearExhausted(providerKeyOf(client));
       return { ...fb, fallback_from: fromModel };
     }
-    if (isExhaustedProviderError(fb.error)) markModelExhausted(fbModel);
+    if (isFailoverError(fb.error)) markModelExhausted(fbModel, cooldownMsFor(fb.error));
   }
   return null;
 };
@@ -788,16 +941,16 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
       if (walked) return walked;
     }
     const r = await resolveWithOpenAI(body, wireClient);
-    if (r.resolved === true || !isExhaustedProviderError(r.error)) return r;
-    markModelExhausted(model);
+    if (r.resolved === true || !isFailoverError(r.error)) return r;
+    markModelExhausted(model, cooldownMsFor(r.error));
     const walked = await walkFallbackModels(body, model);
     return walked ?? r;
   }
   // Any vendor/model id not explicitly mapped routes through OpenRouter when keyed.
   if (openrouterClient && model.includes("/") && !model.toLowerCase().startsWith("anthropic/")) {
     const r = await resolveWithOpenAI(body, openrouterClient);
-    if (r.resolved === true || !isExhaustedProviderError(r.error)) return r;
-    markModelExhausted(model);
+    if (r.resolved === true || !isFailoverError(r.error)) return r;
+    markModelExhausted(model, cooldownMsFor(r.error));
     const walked = await walkFallbackModels(body, model);
     return walked ?? r;
   }
@@ -828,11 +981,11 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
     result = provider === "anthropic" ? await resolveWithAnthropic(body) : await resolveWithOpenAI(body);
     if (result.resolved === true) {
       clearExhausted(primaryKey);
-    } else if (isExhaustedProviderError(result.error)) {
-      markExhausted(primaryKey);
+    } else if (isFailoverError(result.error)) {
+      markExhausted(primaryKey, cooldownMsFor(result.error));
     }
   }
-  if (result.resolved !== true && (primaryCoolingDown || isExhaustedProviderError(result.error))) {
+  if (result.resolved !== true && (primaryCoolingDown || isFailoverError(result.error))) {
     const walked = await walkFallbackModels(body, model);
     if (walked) return walked;
     // Last resort: every fallback lane is dead or cooling down — try the
@@ -843,7 +996,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
         clearExhausted(primaryKey);
         return retry;
       }
-      if (isExhaustedProviderError(retry.error)) markExhausted(primaryKey);
+      if (isFailoverError(retry.error)) markExhausted(primaryKey, cooldownMsFor(retry.error));
       return retry;
     }
   }
@@ -917,6 +1070,18 @@ const daemon = new VesselDaemon({
 });
 
 await daemon.start();
+
+// Register self-hosted vLLM models as policy arms so auto-selection can pick
+// them (idempotent — learned arm stats survive restarts). Best-effort: a policy
+// write failure must not block the vessel from serving.
+if (SELF_HOSTED_VLLM_MODELS.length > 0) {
+  try {
+    const added = await ensureArmsForModels(SELF_HOSTED_VLLM_MODELS);
+    console.log(`[llm-resolver-vessel] self-hosted vLLM models registered as policy arms (${added} new): ${SELF_HOSTED_VLLM_MODELS.join(", ")}`);
+  } catch (err) {
+    console.warn("[llm-resolver-vessel] failed to seed vLLM policy arms (non-fatal):", err);
+  }
+}
 
 const providers: string[] = [];
 if (anthropic) providers.push("anthropic");
