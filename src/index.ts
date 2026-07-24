@@ -104,6 +104,14 @@ interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; m
 const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   { id: "chutes", baseURL: "https://llm.chutes.ai/v1", apiKeyEnv: "CHUTES_API_KEY",
     models: ["zai-org/GLM-5.1-TEE", "zai-org/GLM-5.2-TEE", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"] },
+  // FUNDED quota providers (groq + mistral) placed HIGH so the exhaustion
+  // failover walk reaches them before the rate-limited openrouter-free / gemini
+  // lanes — under load the fleet was burning all four gemini models (each 45s
+  // cooling) before ever trying groq's llama-3.3, leaving the funded quota idle.
+  { id: "groq", baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY",
+    models: ["llama-3.3-70b-versatile", "moonshotai/kimi-k2-instruct", "qwen/qwen3-32b"] },
+  { id: "mistral", baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY",
+    models: ["mistral-small-latest", "codestral-latest", "mistral-large-latest"] },
   // OpenRouter serves arbitrary vendor/model ids - it is the catch-all for any
   // slash-qualified model not explicitly mapped above (see resolve entry point).
   // Free-tier openrouter models (verified live 2026-07-14) — the last-resort
@@ -121,10 +129,6 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
              "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free", "tencent/hy3:free"] },
   { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
     models: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-flash-preview"] },
-  { id: "groq", baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY",
-    models: ["llama-3.3-70b-versatile", "moonshotai/kimi-k2-instruct", "qwen/qwen3-32b"] },
-  { id: "mistral", baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY",
-    models: ["mistral-small-latest", "codestral-latest", "mistral-large-latest"] },
 ];
 
 // Self-hosted vLLM endpoints (Vast.ai / RunPod behind a Cloudflare Tunnel) are
