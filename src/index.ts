@@ -1083,6 +1083,30 @@ if (SELF_HOSTED_VLLM_MODELS.length > 0) {
   }
 }
 
+// Register FUNDED wire-provider models (groq, mistral) as policy arms so the
+// Thompson selector can actually route to their quota. They are in the provider
+// registry (routable via modelClientMap) but were never seeded as ARMS, so
+// selectArm never picked them as primary — under load the fleet burned the
+// rate-limited anthropic/gemini/openrouter-free arms and never reached the
+// funded capacity (observed: the hub arm flapping on gemini-2.5-* / cooling,
+// while GROQ_API_KEY + MISTRAL_API_KEY sat unused). Seed each at its published
+// per-Mtok cost so the cost-discount term is honest; only when the key is
+// present. Idempotent — learned alpha/beta survive restarts.
+const FUNDED_ARM_COST: Record<string, number> = {
+  "llama-3.3-70b-versatile": 0.6, "moonshotai/kimi-k2-instruct": 1.0, "qwen/qwen3-32b": 0.5,
+  "mistral-small-latest": 0.2, "codestral-latest": 0.3, "mistral-large-latest": 2.0,
+};
+for (const provId of ["groq", "mistral"]) {
+  const prov = OPENAI_WIRE_PROVIDERS.find((pr) => pr.id === provId);
+  if (!prov || !cleanEnv(process.env[prov.apiKeyEnv])) continue;
+  let seeded = 0;
+  for (const m of prov.models) {
+    try { seeded += await ensureArmsForModels([m], FUNDED_ARM_COST[m] ?? 0.6, `funded ${provId}`); }
+    catch (err) { console.warn(`[llm-resolver-vessel] failed to seed ${provId} arm '${m}' (non-fatal):`, err); }
+  }
+  console.log(`[llm-resolver-vessel] funded ${provId} models registered as policy arms (${seeded} new): ${prov.models.join(", ")}`);
+}
+
 const providers: string[] = [];
 if (anthropic) providers.push("anthropic");
 if (openaiClient) {
