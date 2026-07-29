@@ -24,6 +24,7 @@ export interface PolicyArm {
   note?: string;
   task_alpha?: Record<string, number>;
   task_beta?: Record<string, number>;
+  last_updated_at?: string;
 }
 export interface ModelPolicy {
   rev: number;
@@ -73,6 +74,17 @@ export async function savePolicy(policy: ModelPolicy): Promise<void> {
   cached = { at: Date.now(), policy };
 }
 
+/** Exponential decay pulling alpha and beta toward neutral prior (1,1) with 3-day half-life. */
+function decayedCounts(alpha: number, beta: number, lastUpdatedAt: string | undefined, nowMs: number): { alpha: number; beta: number } {
+  const ageMs = nowMs - (lastUpdatedAt ? new Date(lastUpdatedAt).getTime() : 0);
+  const halfLifeMs = 3 * 24 * 60 * 60 * 1000;
+  const d = Math.pow(0.5, ageMs / halfLifeMs);
+  return {
+    alpha: 1 + (alpha - 1) * d,
+    beta: 1 + (beta - 1) * d,
+  };
+}
+
 /** Beta(a,b) sample via normal approximation (adequate for bandit selection;
  * exact gamma sampling is overkill here and this stays dependency-free). */
 function betaSample(a: number, b: number): number {
@@ -99,9 +111,10 @@ export async function selectArm(taskType?: string, availableModels?: string[]): 
     if (availableModels && !availableModels.includes(arm.model)) continue;
     const taskAlpha = taskType && arm.task_alpha && arm.task_alpha[taskType] !== undefined ? arm.task_alpha[taskType]! : arm.alpha;
     const taskBeta = taskType && arm.task_beta && arm.task_beta[taskType] !== undefined ? arm.task_beta[taskType]! : arm.beta;
-    const draw = betaSample(taskAlpha, taskBeta);
+    const decayed = decayedCounts(taskAlpha, taskBeta, arm.last_updated_at, Date.now());
+    const draw = betaSample(decayed.alpha, decayed.beta);
     const score = draw - policy.cost_weight * (arm.cost_per_mtok / maxCost);
-    considered.push({ model: arm.model, draw: Number(draw.toFixed(4)), score: Number(score.toFixed(4)), alpha: taskAlpha, beta: taskBeta, cost_per_mtok: arm.cost_per_mtok });
+    considered.push({ model: arm.model, draw: Number(draw.toFixed(4)), score: Number(score.toFixed(4)), alpha: decayed.alpha, beta: decayed.beta, cost_per_mtok: arm.cost_per_mtok });
     if (!best || score > best.score) best = { arm, score };
   }
   if (!best) return null;
@@ -123,16 +136,23 @@ export async function recordArmOutcome(model: string, ok: boolean, taskType?: st
   const policy = await loadPolicy();
   const arm = policy.arms.find((a) => a.model === model);
   if (!arm) return;
+  const now = Date.now();
   if (taskType) {
     arm.task_alpha = arm.task_alpha ?? {};
     arm.task_beta = arm.task_beta ?? {};
-    const a = (arm.task_alpha[taskType] ?? arm.alpha) + (ok ? 1 : 0);
-    const b = (arm.task_beta[taskType] ?? arm.beta) + (ok ? 0 : 1);
+    const prevTaskAlpha = arm.task_alpha[taskType] ?? arm.alpha;
+    const prevTaskBeta = arm.task_beta[taskType] ?? arm.beta;
+    const decayed = decayedCounts(prevTaskAlpha, prevTaskBeta, arm.last_updated_at, now);
+    const a = decayed.alpha + (ok ? 1 : 0);
+    const b = decayed.beta + (ok ? 0 : 1);
     arm.task_alpha[taskType] = a;
     arm.task_beta[taskType] = b;
   } else {
-    if (ok) arm.alpha += 1; else arm.beta += 1;
+    const decayed = decayedCounts(arm.alpha, arm.beta, arm.last_updated_at, now);
+    arm.alpha = decayed.alpha + (ok ? 1 : 0);
+    arm.beta = decayed.beta + (ok ? 0 : 1);
   }
+  arm.last_updated_at = new Date().toISOString();
   await savePolicy(policy);
 }
 
