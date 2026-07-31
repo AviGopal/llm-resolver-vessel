@@ -790,7 +790,10 @@ const isExhaustedProviderError = (e: unknown): boolean => {
       (m.includes("unavailable") ||
         m.includes("paid") ||
         m.includes("use this slug") ||
-        m.includes("no endpoints")))
+        m.includes("no endpoints"))) ||
+    m.includes("not a valid model") ||
+    m.includes("model_not_found") ||
+    m.includes("invalid model id")
   );
 };
 
