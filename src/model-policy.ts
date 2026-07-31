@@ -104,7 +104,7 @@ export interface ArmSelection {
 export async function selectArm(taskType?: string, availableModels?: string[]): Promise<ArmSelection | null> {
   const policy = await loadPolicy();
   if (policy.arms.length === 0) return null;
-  const maxCost = Math.max(...policy.arms.map((a) => a.cost_per_mtok), 0.01);
+  const maxCost = Math.max(...policy.arms.map((a) => a.cost_per_mtok ?? 0), 0.01);
   let best: { arm: PolicyArm; score: number } | null = null;
   const considered: Array<Record<string, unknown>> = [];
   for (const arm of policy.arms) {
@@ -114,7 +114,7 @@ export async function selectArm(taskType?: string, availableModels?: string[]): 
     const taskBeta = hasTask ? arm.task_beta![taskType]! : (taskType ? 1 : arm.beta);
     const decayed = decayedCounts(taskAlpha, taskBeta, arm.last_updated_at, Date.now());
     const draw = betaSample(decayed.alpha, decayed.beta);
-    const score = draw - policy.cost_weight * (arm.cost_per_mtok / maxCost);
+    const score = draw - policy.cost_weight * ((arm.cost_per_mtok ?? 0) / maxCost);
     considered.push({ model: arm.model, draw: Number(draw.toFixed(4)), score: Number(score.toFixed(4)), alpha: decayed.alpha, beta: decayed.beta, cost_per_mtok: arm.cost_per_mtok });
     if (!best || score > best.score) best = { arm, score };
   }

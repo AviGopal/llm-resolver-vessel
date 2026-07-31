@@ -1075,7 +1075,16 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
   const result = await llmCompletionHandler({ ...ctx, body: { ...body, model: sel.model } } as never);
   try {
     (result as Record<string, unknown>).model_selection = sel.meta;
-    await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true, body.task_type);
+    // HONESTY (2026-07-31): drafting task-types grade on resolved===true = "the LLM answered",
+    // which measures RESPONSIVENESS, not edit CAPABILITY — it false-inflates fast-but-weak arms
+    // (haiku patch_with_tools 4020/36) and starves capable ones, so "auto" converges on a weak
+    // drafter. Skip the dishonest grade for drafting tasks; true drafting capability must be
+    // graded by the edit OUTCOME (reach/verified), which is wired separately (needs credit-
+    // assignment: select-once-per-draft + outcome callback). Non-drafting tasks keep the grade.
+    const DRAFTING_TASK_TYPES = new Set(["feature_compose", "patch_with_tools"]);
+    if (!DRAFTING_TASK_TYPES.has(body.task_type ?? "")) {
+      await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true, body.task_type);
+    }
   } catch (err) {
     console.warn("[llm-resolver-vessel] policy outcome record failed (non-fatal):", err);
   }
