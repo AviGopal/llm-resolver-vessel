@@ -36,7 +36,7 @@ import {
   VesselDaemon,
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
-import { selectArm, recordArmOutcome, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels } from "./model-policy.js";
+import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels } from "./model-policy.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -875,6 +875,22 @@ const cooldownMsFor = (e: unknown): number => {
 const modelExhaustedUntil = new Map<string, number>();
 const inModelCooldown = (m: string): boolean => (modelExhaustedUntil.get(m) ?? 0) > Date.now();
 
+// Willing = this resolver can route the model right now AND neither the model
+// nor its provider is in exhaustion cooldown. Derived from actual routing
+// capability (mirrors llmCompletionHandler's branches), never a hardcoded list,
+// so every reachable policy arm is selectable and advertised-willing == routable.
+function isModelWilling(model: string): boolean {
+  const client = modelClientMap.get(model);
+  if (client) return !inModelCooldown(model) && !inCooldown(providerKeyOf(client));
+  if (model.startsWith("claude") || model.startsWith("anthropic/")) {
+    return anthropic !== null && !inCooldown("anthropic") && !inModelCooldown(model);
+  }
+  if (openrouterClient && model.includes("/")) {
+    return !inCooldown(providerKeyOf(openrouterClient)) && !inModelCooldown(model);
+  }
+  return false;
+}
+
 // Quota gate for advertisement: any uncooled keyed wire model, or the
 // anthropic/openai lanes still outside cooldown, means completion is servable.
 // Mirrors the availableModels expression used for policy arm selection
@@ -1036,8 +1052,11 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
     if (wireLive || provLive) return llmCompletionHandler(ctx);
     // pinned arm is dry → drop the pin and select a live arm by policy below.
   }
-  const availableModels = [...[...modelClientMap.keys()].filter(m => !inModelCooldown(m)), ...(anthropic && !inCooldown("anthropic") ? ["claude-sonnet-5","claude-haiku-4-5-20251001"] : [])];
-const sel = await selectArm(body.task_type, availableModels);
+  // Willing set = every policy arm this resolver can route RIGHT NOW (law 1: the
+  // selectable pool is derived+filtered, not a frozen subset). loadPolicy is cached.
+  const policyForWilling = await loadPolicy();
+  const availableModels = policyForWilling.arms.map((a) => a.model).filter((m) => isModelWilling(m));
+  const sel = await selectArm(body.task_type, availableModels);
   if (!sel) return llmCompletionHandler(ctx);
   const result = await llmCompletionHandler({ ...ctx, body: { ...body, model: sel.model } } as never);
   try {
