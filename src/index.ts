@@ -815,8 +815,12 @@ const isUnreachableProviderError = (e: unknown): boolean => {
     m.includes("terminated") ||
     // Gateway/edge unavailability (Cloudflare Tunnel origin down, vLLM loading
     // weights) — standalone status codes only, regex-guarded so a token count
-    // like "50231" cannot false-positive.
-    /(?:^|[^0-9])(?:502|503|504)(?:[^0-9]|$)/.test(m)
+    // like "50231" cannot false-positive. Includes Cloudflare's origin-error
+    // range 520-527 + 530: a self-hosted pod whose CF tunnel origin is down
+    // returns 530 (added 2026-07-31 — a dead q3-32b pod was returning 530, which
+    // matched none of these, so it never cooled and the MAB re-sampled it every
+    // draw, burning a timeout each time; now it auto-cools like credit exhaustion).
+    /(?:^|[^0-9])(?:502|503|504|52[0-7]|530)(?:[^0-9]|$)/.test(m)
   );
 };
 
