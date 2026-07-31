@@ -109,8 +109,9 @@ export async function selectArm(taskType?: string, availableModels?: string[]): 
   const considered: Array<Record<string, unknown>> = [];
   for (const arm of policy.arms) {
     if (availableModels && !availableModels.includes(arm.model)) continue;
-    const taskAlpha = taskType && arm.task_alpha && arm.task_alpha[taskType] !== undefined ? arm.task_alpha[taskType]! : arm.alpha;
-    const taskBeta = taskType && arm.task_beta && arm.task_beta[taskType] !== undefined ? arm.task_beta[taskType]! : arm.beta;
+    const hasTask = !!(taskType && arm.task_alpha && arm.task_alpha[taskType] !== undefined);
+    const taskAlpha = hasTask ? arm.task_alpha![taskType]! : (taskType ? 1 : arm.alpha);
+    const taskBeta = hasTask ? arm.task_beta![taskType]! : (taskType ? 1 : arm.beta);
     const decayed = decayedCounts(taskAlpha, taskBeta, arm.last_updated_at, Date.now());
     const draw = betaSample(decayed.alpha, decayed.beta);
     const score = draw - policy.cost_weight * (arm.cost_per_mtok / maxCost);
