@@ -58,6 +58,7 @@ const ANTHROPIC_API_KEY = cleanEnv(process.env.ANTHROPIC_API_KEY);
 const OPENAI_API_KEY = cleanEnv(process.env.OPENAI_API_KEY);
 const OPENAI_BASE_URL = cleanEnv(process.env.OPENAI_BASE_URL); // default: OpenAI; set for Ollama/Groq/etc.
 const LLM_PROVIDER = (cleanEnv(process.env.LLM_PROVIDER) ?? "auto") as "anthropic" | "openai" | "auto";
+const LLM_PINNED_PROVIDER = cleanEnv(process.env.LLM_PINNED_PROVIDER) ?? null;
 
 const DEFAULT_MODEL = cleanEnv(process.env.LLM_DEFAULT_MODEL) ?? "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS = 4096;
@@ -900,10 +901,20 @@ function isModelWilling(model: string): boolean {
 // (llmCompletionWithPolicyHandler) so the advertised set and the routable set
 // never disagree — and it is model-granular, so :free siblings keep the shape
 // advertised even when a paid model on the same baseURL is cooling.
-const hasCompletionQuota = (): boolean =>
-  [...modelClientMap.keys()].some((m) => !inModelCooldown(m)) ||
-  (anthropic !== null && !inCooldown("anthropic")) ||
-  (openaiClient !== null && !inCooldown("openai"));
+// When LLM_PINNED_PROVIDER is set, check only that provider's quota.
+const hasCompletionQuota = (): boolean => {
+  if (LLM_PINNED_PROVIDER) {
+    if (LLM_PINNED_PROVIDER === "anthropic") return anthropic !== null && !inCooldown("anthropic");
+    if (LLM_PINNED_PROVIDER === "openai") return openaiClient !== null && !inCooldown("openai");
+    const pinned = OPENAI_WIRE_PROVIDERS.find((p) => p.id === LLM_PINNED_PROVIDER);
+    return pinned ? pinned.models.some((m) => modelClientMap.has(m) && !inModelCooldown(m)) : false;
+  }
+  return (
+    [...modelClientMap.keys()].some((m) => !inModelCooldown(m)) ||
+    (anthropic !== null && !inCooldown("anthropic")) ||
+    (openaiClient !== null && !inCooldown("openai"))
+  );
+};
 
 // Condition-driven resume of a de-advertised completion plane. A dropped shape
 // receives no traffic, so nothing would ever clear a passively-expiring model
