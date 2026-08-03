@@ -413,7 +413,7 @@ async function anthropicCreditFallback(
     (status === 400 && errType === "invalid_request_error" && (combined.includes("billing") || combined.includes("credit")));
   if (!isCreditDead) return null;
   const fallbackModel = (await selectArm("credit_dead_fallback", [...modelClientMap.keys()]))?.model;
-  if (!fallbackModel) return null;
+  if (!fallbackModel) { markExhausted("anthropic", 30 * 60_000); return null; }
   const client = modelClientMap.get(fallbackModel);
   if (!client) return null;
   console.log(`[llm-resolver-vessel] anthropic credit-dead — falling back to ${fallbackModel}`);
