@@ -747,7 +747,15 @@ const exhaustedUntil = new Map<string, number>();
 const providerKeyOf = (client: OpenAI): string => String((client as { baseURL?: unknown }).baseURL ?? "openai-wire");
 const inCooldown = (key: string): boolean => (exhaustedUntil.get(key) ?? 0) > Date.now();
 const markExhausted = (key: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
-  exhaustedUntil.set(key, Date.now() + ms);
+  // MONOTONIC COOLDOWN. Never shorten a window already in force. A credit-dead
+  // provider is deliberately cooled for 30 minutes by anthropicCreditFallback,
+  // but the generic cooldownMsFor() call in the resolve path then re-marked the
+  // same key with the 10-minute default and CLOBBERED it — so a permanently dead
+  // lane was retried three times more often than intended, and every retry
+  // re-flipped the llm_completion advertisement through discovery. Only extend.
+  const until = Date.now() + ms;
+  if ((exhaustedUntil.get(key) ?? 0) >= until) return;
+  exhaustedUntil.set(key, until);
   console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(ms / 1000)}s before retry`);
   void syncCompletionAdvertisement();
   scheduleAdvertisementResume(ms);
