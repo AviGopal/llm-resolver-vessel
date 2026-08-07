@@ -29,6 +29,7 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
+import { classifyPlane, type ProviderState } from "./plane-outage";
 import OpenAI from "openai";
 import {
   ActivityExecutor,
@@ -46,6 +47,10 @@ const PORT = parseInt(process.env.PORT ?? "8220", 10);
 const VESSEL_ID = process.env.LLM_RESOLVER_VESSEL_ID ?? process.env.VESSEL_ID ?? "llm-resolver-vessel";
 const DISCOVERY_ENDPOINT = process.env.DISCOVERY_VESSEL_ENDPOINT ?? "http://127.0.0.1:8100";
 const API_KEY = process.env.LLM_RESOLVER_VESSEL_API_KEY ?? process.env.METABOB_API_KEY;
+// Bootstrap-tier fallback only: discovery owns the real address for substrateGap_write and is
+// consulted first. This literal exists so a detector still has somewhere to report when the
+// registry itself is the thing that is unreachable.
+const DEV_VESSEL_FALLBACK = process.env.DEVELOPMENT_VESSEL_ENDPOINT ?? "http://127.0.0.1:8090";
 
 // Provider config
 // Env values arrive quoted from some generators (VAR="") - a quote-only or empty
@@ -210,10 +215,51 @@ async function syncCompletionAdvertisement(): Promise<void> {
   } else {
     console.warn("[llm-resolver-vessel] all completion providers cooling — de-advertising llm_completion until quota returns");
   }
+  // De-advertising is the correct REACTION and a poor DETECTION: the registry quietly loses a
+  // shape and every caller degrades in silence. Observed 2026-08-07 — the whole plane was
+  // credit-dead for the length of a session, reach grading fell back to deterministic oracles
+  // only, and no gap was ever filed. File one (law 6).
+  void reportPlaneState();
   try {
     await daemon.setShapes(shapes);
   } catch (err) {
     console.warn("[llm-resolver-vessel] syncCompletionAdvertisement: setShapes failed (non-fatal)", err);
+  }
+}
+
+/**
+ * File (or close) the plane-dark gap from the SAME provider table `llmQuotaState` serves, so
+ * the gap and the observable state can never disagree.
+ *
+ * Fails open and silent by design: this vessel's job is serving completions, and a gap-store
+ * hiccup must never interfere with that. It is a detector, not a dependency.
+ */
+let lastPlaneDark: boolean | null = null;
+async function reportPlaneState(): Promise<void> {
+  try {
+    const state = (await llmQuotaStateHandler({ body: null })).body as { providers: Record<string, ProviderState> };
+    const verdict = classifyPlane(state.providers ?? {}, Date.now());
+
+    // Only write on a TRANSITION. A steady-state outage re-emitting on every advertisement
+    // sync would bury the store under one row's worth of noise — the flood the stable gap ids
+    // elsewhere in the fleet exist to avoid.
+    if (lastPlaneDark === verdict.dark) return;
+    lastPlaneDark = verdict.dark;
+
+    const endpoint = await resolveToolEndpoint("substrateGap_write", `${DEV_VESSEL_FALLBACK}/v2/impulses/resolve`);
+    const gap = verdict.dark
+      ? { id: verdict.id, category: "infrastructure", source: "substrate_detected", status: "open", summary: verdict.summary, detected_at: new Date().toISOString() }
+      : { id: "llm-completion-plane-dark", category: "infrastructure", source: "substrate_detected", status: "closed", summary: `[closed] The LLM completion plane recovered — ${verdict.reason}.`, detected_at: new Date().toISOString() };
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (API_KEY) headers.Authorization = `ApiKey ${API_KEY}`;
+    await fetch(endpoint, {
+      method: "POST", headers,
+      body: JSON.stringify({ impulse: { type: "substrateGap_write", pointer: { type: "substrateGap_write", gap } } }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    console.log(`[llm-resolver-vessel] plane ${verdict.dark ? "DARK — filed" : "recovered — closed"} gap llm-completion-plane-dark`);
+  } catch (err) {
+    console.warn("[llm-resolver-vessel] reportPlaneState failed (non-fatal)", err instanceof Error ? err.message : String(err));
   }
 }
 
