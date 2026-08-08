@@ -67,4 +67,14 @@ describe("isScaleToZeroCold — gating is scoped to the metered lane", () => {
     const none: ReadonlySet<string> = new Set();
     expect(isScaleToZeroCold("Qwen/Qwen3-Coder-Next-FP8", none, false)).toBe(false);
   });
+
+  it("REGRESSION: the same model id served by a self-hosted arm must not be gated", () => {
+    // Qwen/Qwen3-Coder-Next-FP8 is also what a VLLM_ENDPOINTS instance serves.
+    // The caller must pass an EMPTY set when no RunPod endpoint is configured,
+    // or an always-on self-hosted arm serving that id would be gated on the
+    // readiness of an endpoint that does not exist. Caught pre-merge.
+    const noRunpodConfigured: ReadonlySet<string> = new Set();
+    expect(isScaleToZeroCold("Qwen/Qwen3-Coder-Next-FP8", noRunpodConfigured, false)).toBe(false);
+    expect(isScaleToZeroCold("Qwen/Qwen3-Coder-Next-FP8", noRunpodConfigured, true)).toBe(false);
+  });
 });

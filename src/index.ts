@@ -120,8 +120,14 @@ if (OPENAI_API_KEY) {
 // each such pick would burn a 20-40 min timeout and charge the loss to the
 // model's reach evidence rather than to the cold start.
 const RUNPOD_ENDPOINT_ID = cleanEnv(process.env.RUNPOD_ENDPOINT_ID);
-const RUNPOD_MODELS = (cleanEnv(process.env.RUNPOD_MODELS) ?? "Qwen/Qwen3-Coder-Next-FP8")
-  .split(",").map((m) => m.trim()).filter(Boolean);
+// Empty unless an endpoint is configured. The model-id default must NOT leak
+// out when RUNPOD_ENDPOINT_ID is unset: these ids also name models a self-hosted
+// VLLM_ENDPOINTS instance may serve, and a non-empty set here would gate that
+// perfectly-warm arm on the readiness of an endpoint that does not exist.
+const RUNPOD_MODELS = RUNPOD_ENDPOINT_ID
+  ? (cleanEnv(process.env.RUNPOD_MODELS) ?? "Qwen/Qwen3-Coder-Next-FP8")
+      .split(",").map((m) => m.trim()).filter(Boolean)
+  : [];
 // Operator-tunable prior, NOT a measured rate: RunPod publishes no per-token
 // price for serverless (billing is GPU-seconds), so this seeds the arm in the
 // same band as the cheap hosted arms until real cost/throughput evidence lands.
