@@ -131,7 +131,14 @@ const RUNPOD_MODELS = RUNPOD_ENDPOINT_ID
 // Operator-tunable prior, NOT a measured rate: RunPod publishes no per-token
 // price for serverless (billing is GPU-seconds), so this seeds the arm in the
 // same band as the cheap hosted arms until real cost/throughput evidence lands.
-const RUNPOD_COST_PER_MTOK = Number(cleanEnv(process.env.RUNPOD_COST_PER_MTOK) ?? "0.35");
+// Must fall back on a non-finite parse, not pass NaN through: NaN survives into
+// the arm, JSON.stringify writes it as null, and `cost_per_mtok ?? 0` then reads
+// back a ZERO-cost arm — the outbid-everything trap this design exists to avoid,
+// reachable from a single typo'd env var.
+const RUNPOD_COST_PER_MTOK = ((): number => {
+  const n = Number(cleanEnv(process.env.RUNPOD_COST_PER_MTOK) ?? "0.35");
+  return Number.isFinite(n) && n >= 0 ? n : 0.35;
+})();
 
 // OpenAI-wire-compatible provider registry: add a service as data, not a new code path.
 // defaultKey lets a keyless self-hosted endpoint (vLLM with no --api-key) still
