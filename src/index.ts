@@ -38,7 +38,7 @@ import {
   VesselDaemon,
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
-import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels } from "./model-policy.js";
+import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm } from "./model-policy.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -1276,10 +1276,18 @@ await daemon.start();
 // Register self-hosted vLLM models as policy arms so auto-selection can pick
 // them (idempotent — learned arm stats survive restarts). Best-effort: a policy
 // write failure must not block the vessel from serving.
-if (SELF_HOSTED_VLLM_MODELS.length > 0) {
+// RunPod models are excluded here and seeded below at their real price instead.
+// A RunPod endpoint reachable via VLLM_ENDPOINTS looks like any other
+// self-hosted vLLM to this path, and this path runs FIRST — so without the skip
+// it wins the race and registers metered GPU-second capacity at cost 0, which
+// ensureArmsForModels then refuses to correct because the arm already exists.
+// The 0 default is right for what it was written for (an always-on box already
+// paid for, e.g. the q3-30b tunnel instance) and wrong for scale-to-zero.
+const SELF_HOSTED_ONLY_MODELS = SELF_HOSTED_VLLM_MODELS.filter((m) => !RUNPOD_MODEL_SET.has(m));
+if (SELF_HOSTED_ONLY_MODELS.length > 0) {
   try {
-    const added = await ensureArmsForModels(SELF_HOSTED_VLLM_MODELS);
-    console.log(`[llm-resolver-vessel] self-hosted vLLM models registered as policy arms (${added} new): ${SELF_HOSTED_VLLM_MODELS.join(", ")}`);
+    const added = await ensureArmsForModels(SELF_HOSTED_ONLY_MODELS);
+    console.log(`[llm-resolver-vessel] self-hosted vLLM models registered as policy arms (${added} new): ${SELF_HOSTED_ONLY_MODELS.join(", ")}`);
   } catch (err) {
     console.warn("[llm-resolver-vessel] failed to seed vLLM policy arms (non-fatal):", err);
   }
@@ -1293,8 +1301,18 @@ if (SELF_HOSTED_VLLM_MODELS.length > 0) {
 // only ever SELECTABLE while warm — see isModelWilling.
 if (RUNPOD_ENDPOINT_ID && cleanEnv(process.env.RUNPOD_API_KEY)) {
   try {
-    const added = await ensureArmsForModels(RUNPOD_MODELS, RUNPOD_COST_PER_MTOK, "runpod serverless (metered; gated while cold)");
+    const note = "runpod serverless (metered; gated while cold)";
+    const added = await ensureArmsForModels(RUNPOD_MODELS, RUNPOD_COST_PER_MTOK, note);
     console.log(`[llm-resolver-vessel] runpod-serverless models registered as policy arms (${added} new) at ${RUNPOD_COST_PER_MTOK}/Mtok: ${RUNPOD_MODELS.join(", ")}`);
+    // Repair arms the generic self-hosted path already created at 0 before the
+    // skip above existed. Scoped to RUNPOD_MODELS so the always-on self-hosted
+    // arms — for which 0 is correct — are never touched, and one-shot because
+    // the repair rewrites the marker note it matches on.
+    for (const m of RUNPOD_MODELS) {
+      if (await repriceSeededArm(m, RUNPOD_COST_PER_MTOK, "self-hosted vLLM", note)) {
+        console.log(`[llm-resolver-vessel] repriced '${m}' 0 -> ${RUNPOD_COST_PER_MTOK}/Mtok (was seeded cost-blind as generic self-hosted vLLM)`);
+      }
+    }
   } catch (err) {
     console.warn("[llm-resolver-vessel] failed to seed runpod policy arms (non-fatal):", err);
   }

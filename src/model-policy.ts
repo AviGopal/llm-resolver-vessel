@@ -179,6 +179,37 @@ export async function ensureArmsForModels(models: string[], costPerMtok = 0, not
   return added;
 }
 
+/** One-shot repair for an arm that a COST-BLIND registration path created at the
+ * `ensureArmsForModels` 0 default, when the model actually costs money.
+ *
+ * Needed because two paths can register the same model and the cheap one may
+ * win the race: a RunPod Serverless model reachable via VLLM_ENDPOINTS is seeded
+ * by the generic self-hosted path at 0 before the RunPod-aware path can seed it
+ * at its real price, and `ensureArmsForModels` then leaves the existing arm
+ * alone. A 0-cost arm takes the cost-discount term outright, so the mispricing
+ * does not self-correct — nothing about later evidence touches `cost_per_mtok`.
+ *
+ * Deliberately narrow, because "repair" and "stomp the operator" are the same
+ * edit seen from different sides. The CALLER scopes which models are eligible,
+ * and the repair only fires while the arm still carries the exact seeding marker
+ * it was created with AND is still at 0 — so a deliberate operator price
+ * (including a deliberate 0) is never touched, and rewriting the note makes the
+ * repair idempotent: it cannot fire twice. Learned alpha/beta and task stats are
+ * preserved untouched — the price was wrong, the evidence was not. */
+export async function repriceSeededArm(
+  model: string, costPerMtok: number, fromNote: string, toNote: string,
+): Promise<boolean> {
+  const policy = await loadPolicy();
+  const arm = policy.arms.find((a) => a.model === model);
+  if (!arm) return false;
+  if (arm.note !== fromNote || (arm.cost_per_mtok ?? 0) !== 0) return false;
+  arm.cost_per_mtok = costPerMtok;
+  arm.note = toNote;
+  policy.rev += 1;
+  await savePolicy(policy);
+  return true;
+}
+
 export function providerFor(modelId: string): string {
   if (modelId.startsWith("claude")) return "anthropic";
   if (modelId.startsWith("gemini")) return "google";
