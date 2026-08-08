@@ -30,6 +30,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { classifyPlane, type ProviderState } from "./plane-outage";
+import { isScaleToZeroCold, isWarmFromHealth } from "./scale-to-zero";
 import OpenAI from "openai";
 import {
   ActivityExecutor,
@@ -103,6 +104,29 @@ if (OPENAI_API_KEY) {
   console.warn("[llm-resolver-vessel] Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY set. All resolve calls will fail.");
 }
 
+// RunPod Serverless — a vendor wire host (api.runpod.ai) whose path carries a
+// per-deployment endpoint id, so only the id, the served model ids and the key
+// are operator input; the URL shape is fixed and belongs in the registry below
+// like any other vendor. Distinct from the VLLM_* self-hosted forms further
+// down, which point at a per-instance hostname behind a tunnel.
+//
+// This capacity SCALES TO ZERO. When no worker is up, the first request pays an
+// image-pull + engine-load tail measured at 20-40 min on these baked images —
+// so the arm is only offered while some worker is already warm (see
+// isRunpodCold / isModelWilling). cost_per_mtok is therefore the honest WARM
+// price; "cold" is expressed as not-routable, never as an inflated price,
+// because the policy's cost term is bounded (cost_weight, 0.25) while a Beta
+// draw spans [0,1] — a merely-expensive cold arm would still be explored, and
+// each such pick would burn a 20-40 min timeout and charge the loss to the
+// model's reach evidence rather than to the cold start.
+const RUNPOD_ENDPOINT_ID = cleanEnv(process.env.RUNPOD_ENDPOINT_ID);
+const RUNPOD_MODELS = (cleanEnv(process.env.RUNPOD_MODELS) ?? "Qwen/Qwen3-Coder-Next-FP8")
+  .split(",").map((m) => m.trim()).filter(Boolean);
+// Operator-tunable prior, NOT a measured rate: RunPod publishes no per-token
+// price for serverless (billing is GPU-seconds), so this seeds the arm in the
+// same band as the cheap hosted arms until real cost/throughput evidence lands.
+const RUNPOD_COST_PER_MTOK = Number(cleanEnv(process.env.RUNPOD_COST_PER_MTOK) ?? "0.35");
+
 // OpenAI-wire-compatible provider registry: add a service as data, not a new code path.
 // defaultKey lets a keyless self-hosted endpoint (vLLM with no --api-key) still
 // construct an OpenAI client, which requires a non-empty apiKey string.
@@ -135,6 +159,15 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
              "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free", "tencent/hy3:free"] },
   { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
     models: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-flash-preview"] },
+  // LAST in the registry on purpose: the exhaustion failover walk reads this
+  // order, and scale-to-zero capacity is the one lane that must never be
+  // reached ahead of an always-on provider.
+  ...(RUNPOD_ENDPOINT_ID ? [{
+    id: "runpod-serverless",
+    baseURL: `https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/openai/v1`,
+    apiKeyEnv: "RUNPOD_API_KEY",
+    models: RUNPOD_MODELS,
+  }] : []),
 ];
 
 // Self-hosted vLLM endpoints (Vast.ai / RunPod behind a Cloudflare Tunnel) are
@@ -458,7 +491,10 @@ async function anthropicCreditFallback(
   const isCreditDead = combined.includes("credit balance is too low") ||
     (status === 400 && errType === "invalid_request_error" && (combined.includes("billing") || combined.includes("credit")));
   if (!isCreditDead) return null;
-  const fallbackModel = (await selectArm("credit_dead_fallback", [...modelClientMap.keys()]))?.model;
+  // Filter by willingness, not merely by "a client exists": the credit-dead
+  // path fires exactly when the fleet is already degraded, which is the worst
+  // moment to fall back onto a lane that is cooling down or cold-started.
+  const fallbackModel = (await selectArm("credit_dead_fallback", [...modelClientMap.keys()].filter(isModelWilling)))?.model;
   if (!fallbackModel) { markExhausted("anthropic", 30 * 60_000); return null; }
   const client = modelClientMap.get(fallbackModel);
   if (!client) return null;
@@ -933,11 +969,60 @@ const cooldownMsFor = (e: unknown): number => {
 const modelExhaustedUntil = new Map<string, number>();
 const inModelCooldown = (m: string): boolean => (modelExhaustedUntil.get(m) ?? 0) > Date.now();
 
+// Warm state of the scale-to-zero lane. RunPod reports worker counts on /health
+// WITHOUT dispatching a job, so polling never wakes — or bills — the endpoint.
+// Polled in the background rather than probed on demand: willingness is checked
+// on the resolve path, which must not take a network round trip, and a stale
+// reading is harmless in both directions (a missed warm window costs one polling
+// interval of eligibility; a missed cold transition costs one request that the
+// endpoint queues anyway).
+const RUNPOD_MODEL_SET: ReadonlySet<string> = new Set(RUNPOD_MODELS);
+const RUNPOD_HEALTH_URL = RUNPOD_ENDPOINT_ID ? `https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/health` : null;
+const RUNPOD_POLL_MS = 30_000;
+let runpodWarm = false;
+
+async function refreshRunpodWarm(): Promise<void> {
+  if (!RUNPOD_HEALTH_URL) return;
+  const was = runpodWarm;
+  try {
+    const key = cleanEnv(process.env.RUNPOD_API_KEY);
+    const res = await fetch(RUNPOD_HEALTH_URL, {
+      headers: key ? { Authorization: `Bearer ${key}` } : {},
+      signal: AbortSignal.timeout(5_000),
+    });
+    // A non-2xx (401, 5xx, rate limit) yields no reading — isWarmFromHealth is
+    // fed only a body we actually parsed, and anything else falls to the catch.
+    if (!res.ok) throw new Error(`health ${res.status}`);
+    runpodWarm = isWarmFromHealth(await res.json());
+  } catch {
+    runpodWarm = false;  // fail closed — see scale-to-zero.ts
+  }
+  if (was !== runpodWarm) {
+    console.log(`[llm-resolver-vessel] runpod-serverless is now ${runpodWarm ? "WARM — arm eligible" : "COLD — arm gated"}`);
+  }
+}
+
+/** A scale-to-zero model with no worker up is not routable now, whatever its
+ * quota says. Kept separate from cooldown state: this is capacity, not billing. */
+function isRunpodCold(model: string): boolean {
+  return isScaleToZeroCold(model, RUNPOD_MODEL_SET, runpodWarm);
+}
+
+if (RUNPOD_HEALTH_URL) {
+  void refreshRunpodWarm();
+  const t = setInterval(() => { void refreshRunpodWarm(); }, RUNPOD_POLL_MS);
+  (t as unknown as { unref?: () => void }).unref?.();
+}
+
 // Willing = this resolver can route the model right now AND neither the model
 // nor its provider is in exhaustion cooldown. Derived from actual routing
 // capability (mirrors llmCompletionHandler's branches), never a hardcoded list,
 // so every reachable policy arm is selectable and advertised-willing == routable.
 function isModelWilling(model: string): boolean {
+  // Gating here (rather than at the policy) covers every consumer of
+  // willingness at once — arm selection, the exhaustion failover walk and
+  // quota-gated advertisement — so a cold lane cannot be reached down any path.
+  if (isRunpodCold(model)) return false;
   const client = modelClientMap.get(model);
   if (client) return !inModelCooldown(model) && !inCooldown(providerKeyOf(client));
   if (model.startsWith("claude") || model.startsWith("anthropic/")) {
@@ -1184,6 +1269,21 @@ if (SELF_HOSTED_VLLM_MODELS.length > 0) {
     console.log(`[llm-resolver-vessel] self-hosted vLLM models registered as policy arms (${added} new): ${SELF_HOSTED_VLLM_MODELS.join(", ")}`);
   } catch (err) {
     console.warn("[llm-resolver-vessel] failed to seed vLLM policy arms (non-fatal):", err);
+  }
+}
+
+// Register the RunPod Serverless models as policy arms at their WARM price.
+// Seeding at the ensureArmsForModels default of 0 would be wrong here: a 0-cost
+// arm wins the cost-discount term outright and would be picked ahead of every
+// funded arm before any reach evidence exists. That default suits an always-on
+// box already paid for; this capacity is metered per GPU-second. The arm is
+// only ever SELECTABLE while warm — see isModelWilling.
+if (RUNPOD_ENDPOINT_ID && cleanEnv(process.env.RUNPOD_API_KEY)) {
+  try {
+    const added = await ensureArmsForModels(RUNPOD_MODELS, RUNPOD_COST_PER_MTOK, "runpod serverless (metered; gated while cold)");
+    console.log(`[llm-resolver-vessel] runpod-serverless models registered as policy arms (${added} new) at ${RUNPOD_COST_PER_MTOK}/Mtok: ${RUNPOD_MODELS.join(", ")}`);
+  } catch (err) {
+    console.warn("[llm-resolver-vessel] failed to seed runpod policy arms (non-fatal):", err);
   }
 }
 
