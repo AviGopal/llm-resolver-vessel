@@ -39,6 +39,7 @@ import {
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm } from "./model-policy.js";
+import { decideLastResort } from "./last-resort.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -1223,7 +1224,30 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
   const policyForWilling = await loadPolicy();
   const availableModels = policyForWilling.arms.map((a) => a.model).filter((m) => isModelWilling(m));
   const sel = await selectArm(body.task_type, availableModels);
-  if (!sel) return llmCompletionHandler(ctx);
+  if (!sel) {
+    // NOTHING was selectable. The handler below would then fall through to
+    // `body.model ?? DEFAULT_MODEL` and dial the default BLINDLY — which is
+    // exactly how a credit-dead default kept being called in a tight loop
+    // (`credit balance is too low ... cooling down 1800s`, hundreds of times)
+    // while a perfectly warm arm sat unused because nothing had routed to it.
+    //
+    // A default is a LAST RESORT, not a route: it may only be dialled after the
+    // same willingness check every other arm must pass. `isModelWilling` mirrors
+    // all three routing branches (wire client, anthropic, openrouter), so this
+    // cannot wrongly refuse a default that IS servable — the failure it prevents
+    // is dialling one that demonstrably is not.
+    const choice = decideLastResort({
+      pinnedModel: typeof body.model === "string" ? body.model : undefined,
+      defaultModel: DEFAULT_MODEL,
+      armsChecked: availableModels.length,
+      isWilling: isModelWilling,
+    });
+    if ("refuse" in choice) {
+      console.warn(`[llm-resolver-vessel] ${choice.refuse}`);
+      return { resolved: false, shape: "llmCompletion", error: choice.refuse };
+    }
+    return llmCompletionHandler(ctx);
+  }
   const result = await llmCompletionHandler({ ...ctx, body: { ...body, model: sel.model } } as never);
   try {
     (result as Record<string, unknown>).model_selection = sel.meta;
