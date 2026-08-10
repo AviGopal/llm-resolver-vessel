@@ -170,7 +170,13 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   // tool-affordance-not-a-shaped-impulse / dispatch-time selection should be shaped.
   { id: "openrouter", baseURL: "https://openrouter.ai/api/v1", apiKeyEnv: "OPENROUTER_API_KEY",
     models: ["google/gemini-2.5-flash", "openai/gpt-4o-mini", "deepseek/deepseek-chat-v3-0324",
-             "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free", "tencent/hy3:free"] },
+             "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3-nano-30b-a3b:free",
+             // `tencent/hy3:free` was listed here and is NOT offered by OpenRouter
+             // (verified against GET /api/v1/models, 400 models, 14 of them `:free`).
+             // A configured id the provider does not serve is a PHANTOM ARM: it can
+             // never succeed, yet it holds a policy posterior and burns a failover hop
+             // every time it is drawn. Replaced with a verified code-oriented free slug.
+             "cohere/north-mini-code:free"] },
   { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
     models: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-flash-preview"] },
   // LAST in the registry on purpose: the exhaustion failover walk reads this
