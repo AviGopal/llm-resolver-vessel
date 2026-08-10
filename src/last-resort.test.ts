@@ -89,3 +89,48 @@ describe("decideLastResort", () => {
     if ("refuse" in d) expect(d.refuse).toContain("12 policy arm(s) checked");
   });
 });
+
+describe("decideLastResort — a dry default must not blackhole a live plane", () => {
+  test("dials a live ROUTABLE model when the default is dry", () => {
+    // The regression this prevents: all policy ARMS cooling, default dry, but
+    // `google/gemini-2.5-flash` routable and answering. Refusing there reads as
+    // a dead plane while a model is one lookup away.
+    const d = decideLastResort({
+      defaultModel: "claude-sonnet-5",
+      armsChecked: 0,
+      isWilling: (m) => m === "google/gemini-2.5-flash",
+      routableModels: ["nvidia/nemotron-3-nano-30b-a3b:free", "google/gemini-2.5-flash"],
+    });
+    expect(d).toEqual({ dial: "google/gemini-2.5-flash" });
+  });
+
+  test("still refuses when NOTHING routable is willing either", () => {
+    const d = decideLastResort({
+      defaultModel: "claude-sonnet-5",
+      armsChecked: 4,
+      isWilling: () => false,
+      routableModels: ["a/b", "c/d"],
+    });
+    expect("refuse" in d).toBe(true);
+  });
+
+  test("prefers the last resort over an alternative when it IS willing", () => {
+    const d = decideLastResort({
+      defaultModel: "claude-sonnet-5",
+      armsChecked: 0,
+      isWilling: () => true,
+      routableModels: ["some/other"],
+    });
+    expect(d).toEqual({ dial: "claude-sonnet-5" });
+  });
+
+  test("never returns the dry last-resort as its own alternative", () => {
+    const d = decideLastResort({
+      defaultModel: "dry/model",
+      armsChecked: 0,
+      isWilling: (m) => m === "dry/model" ? false : true,
+      routableModels: ["dry/model"],
+    });
+    expect("refuse" in d).toBe(true);
+  });
+});

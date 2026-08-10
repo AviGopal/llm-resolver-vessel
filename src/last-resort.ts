@@ -31,6 +31,17 @@ export interface LastResortInput {
   readonly armsChecked: number;
   /** Same predicate the selector uses: can this model be routed RIGHT NOW? */
   readonly isWilling: (model: string) => boolean;
+  /**
+   * Every model this resolver can ROUTE (the wire-client keyspace), regardless of
+   * whether it is a policy arm.
+   *
+   * Policy arms and routable models are NOT the same set: a provider's models can
+   * be routable while never having been seeded as arms. Without this, a state
+   * where all ARMS are cooling but a routable model is live gets refused — the
+   * plane reads as dead while `google/gemini-2.5-flash` answers on the first try.
+   * Observed exactly that after tightening this guard.
+   */
+  readonly routableModels?: readonly string[];
 }
 
 /**
@@ -41,7 +52,7 @@ export interface LastResortInput {
  * from the willingness check.
  */
 export function decideLastResort(input: LastResortInput): LastResortChoice {
-  const { pinnedModel, defaultModel, armsChecked, isWilling } = input;
+  const { pinnedModel, defaultModel, armsChecked, isWilling, routableModels } = input;
   const pinned =
     typeof pinnedModel === "string" && pinnedModel.length > 0 && pinnedModel !== "auto"
       ? pinnedModel
@@ -56,7 +67,16 @@ export function decideLastResort(input: LastResortInput): LastResortChoice {
     };
   }
 
-  if (!isWilling(lastResort)) {
+  if (isWilling(lastResort)) return { dial: lastResort };
+
+  // The configured last resort is dry — but "this one model is dry" is not the
+  // same claim as "nothing can serve". Before refusing, look for ANY routable
+  // model that is willing. Refusing while a live model sits one lookup away is a
+  // worse outage than the blind-dial bug this guard exists to prevent.
+  const liveAlternative = (routableModels ?? []).find((m) => m !== lastResort && isWilling(m));
+  if (liveAlternative) return { dial: liveAlternative };
+
+  {
     return {
       refuse:
         `no llm arm is currently servable (${armsChecked} policy arm(s) checked); ` +
@@ -64,6 +84,4 @@ export function decideLastResort(input: LastResortInput): LastResortChoice {
         `refused instead of dialling a known-dry model`,
     };
   }
-
-  return { dial: lastResort };
 }

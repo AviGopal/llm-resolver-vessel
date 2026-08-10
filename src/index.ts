@@ -1247,6 +1247,10 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
       defaultModel: DEFAULT_MODEL,
       armsChecked: availableModels.length,
       isWilling: isModelWilling,
+      // Routable != policy arm. A provider's models can be routable without ever
+      // having been seeded as arms, so "no willing ARM" must not be read as
+      // "nothing can serve" — that refused while gemini-2.5-flash answered fine.
+      routableModels: [...modelClientMap.keys()],
     });
     if ("refuse" in choice) {
       console.warn(`[llm-resolver-vessel] ${choice.refuse}`);
