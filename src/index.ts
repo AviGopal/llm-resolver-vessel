@@ -1038,6 +1038,20 @@ if (RUNPOD_HEALTH_URL) {
 // nor its provider is in exhaustion cooldown. Derived from actual routing
 // capability (mirrors llmCompletionHandler's branches), never a hardcoded list,
 // so every reachable policy arm is selectable and advertised-willing == routable.
+// Models OpenRouter actually serves for us, as declared in the provider registry.
+//
+// This replaces a `model.includes("/")` heuristic that treated ANY slash-bearing
+// id as an openrouter model. Slashes are just how most vendors namespace: chutes
+// arms (`moonshotai/…`, `zai-org/…`) and runpod arms (`Qwen/…`) all matched, so a
+// policy arm whose provider had no key — or had been removed entirely — still
+// reported WILLING, got selected, failed, and burned a failover hop into the one
+// model that did work. Measured: 6 unpinned probes selected 6 different arms and
+// 5 of them were served by the same fallback. A selector that picks broadly and
+// executes narrowly is not diversity; it is one model wearing five hats.
+const OPENROUTER_MODEL_SET: ReadonlySet<string> = new Set(
+  OPENAI_WIRE_PROVIDERS.find((p) => p.id === "openrouter")?.models ?? [],
+);
+
 function isModelWilling(model: string): boolean {
   // Gating here (rather than at the policy) covers every consumer of
   // willingness at once — arm selection, the exhaustion failover walk and
@@ -1048,7 +1062,7 @@ function isModelWilling(model: string): boolean {
   if (model.startsWith("claude") || model.startsWith("anthropic/")) {
     return anthropic !== null && !inCooldown("anthropic") && !inModelCooldown(model);
   }
-  if (openrouterClient && model.includes("/")) {
+  if (openrouterClient && OPENROUTER_MODEL_SET.has(model)) {
     return !inCooldown(providerKeyOf(openrouterClient)) && !inModelCooldown(model);
   }
   return false;
@@ -1364,16 +1378,38 @@ if (RUNPOD_ENDPOINT_ID && cleanEnv(process.env.RUNPOD_API_KEY)) {
 const FUNDED_ARM_COST: Record<string, number> = {
   "llama-3.3-70b-versatile": 0.6, "moonshotai/kimi-k2-instruct": 1.0, "qwen/qwen3-32b": 0.5,
   "mistral-small-latest": 0.2, "codestral-latest": 0.3, "mistral-large-latest": 2.0,
+  // openrouter, published per-Mtok input rates; `:free` slugs are genuinely 0 so
+  // the cost-discount term prefers them and only escalates to paid when the free
+  // arms are cooling (their daily quota is account-wide, so they DO run out).
+  "google/gemini-2.5-flash": 0.3, "openai/gpt-4o-mini": 0.15,
+  "deepseek/deepseek-chat-v3-0324": 0.3,
+  "nvidia/nemotron-3-ultra-550b-a55b:free": 0, "nvidia/nemotron-3-nano-30b-a3b:free": 0,
+  "cohere/north-mini-code:free": 0,
 };
-for (const provId of ["groq", "mistral"]) {
+// DERIVE the providers to seed rather than hardcoding a list.
+//
+// This was `["groq", "mistral"]`, which excluded openrouter deliberately — at the
+// time its arms were the rate-limited ones being burned while funded capacity sat
+// idle. That reasoning inverted once openrouter became the only keyed provider:
+// its six models were routable but never ARMS, so `selectArm` could not pick any
+// of them, every unpinned call fell through to the same failover model, and the
+// live policy held SIX arms of which all six were unusable (2 anthropic
+// credit-dead, 2 chutes with no key, 1 slug the provider does not serve, 1 runpod
+// that had been removed). A selectable pool that cannot intersect the routable set
+// is not a selector — it is a single point of failure with extra steps.
+//
+// runpod-serverless is skipped here because it is seeded separately at its real
+// GPU-second-derived price; seeding it at a wire default would misprice it.
+const SEED_SKIP_PROVIDERS = new Set(["runpod-serverless"]);
+for (const provId of OPENAI_WIRE_PROVIDERS.map((pr) => pr.id).filter((id) => !SEED_SKIP_PROVIDERS.has(id))) {
   const prov = OPENAI_WIRE_PROVIDERS.find((pr) => pr.id === provId);
   if (!prov || !cleanEnv(process.env[prov.apiKeyEnv])) continue;
   let seeded = 0;
   for (const m of prov.models) {
-    try { seeded += await ensureArmsForModels([m], FUNDED_ARM_COST[m] ?? 0.6, `funded ${provId}`); }
+    try { seeded += await ensureArmsForModels([m], FUNDED_ARM_COST[m] ?? 0.6, `keyed ${provId}`); }
     catch (err) { console.warn(`[llm-resolver-vessel] failed to seed ${provId} arm '${m}' (non-fatal):`, err); }
   }
-  console.log(`[llm-resolver-vessel] funded ${provId} models registered as policy arms (${seeded} new): ${prov.models.join(", ")}`);
+  console.log(`[llm-resolver-vessel] keyed ${provId} models registered as policy arms (${seeded} new): ${prov.models.join(", ")}`);
 }
 
 const providers: string[] = [];
