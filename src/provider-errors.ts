@@ -95,5 +95,53 @@ export const isUnreachableProviderError = (e: unknown): boolean => {
   );
 };
 
-// A failover-worthy error is either kind; the cooldown length depends on which.
-export const isFailoverError = (e: unknown): boolean => isExhaustedProviderError(e) || isUnreachableProviderError(e);
+// A CREDENTIAL FAILURE IS A THIRD KIND, and it was in neither list.
+//
+// Measured 2026-08-12: the Anthropic key was invalid and the provider answered
+// `401 {"type":"authentication_error","message":"API key is invalid."}` on every
+// call — 566 in one day, continuously from Aug 11 01:44 for 43 hours, zero
+// successful completions fleet-wide. None of those strings matches billing
+// exhaustion or unreachability, so `isFailoverError` was false, `markExhausted`
+// never fired, and the Anthropic client stayed eligible forever.
+//
+// Routing then did exactly what it was told: `pickProvider` sends any `claude*`
+// model to Anthropic whenever the client EXISTS (index.ts:371) — presence of a
+// key, not validity of it. So every draft in the fleet went to a provider that
+// could not answer, while an OpenRouter client that was present, funded, out of
+// cooldown, and able to serve `anthropic/claude-*` sat idle the entire time.
+//
+// This is why it must be its own predicate rather than an addition to the
+// exhaustion list: the three classes have three different repairs — top up the
+// account, wait for the host, or rotate the credential — and `cooldownMsFor`
+// sizes the retry from that distinction. A bad key does not heal on its own, but
+// an operator may rotate it at any moment, so the lane must rejoin rotation on
+// its own rather than being condemned for the process lifetime.
+//
+// Status codes are matched standalone, with the same regex guard the 402/429
+// rules already use: a bare `.includes("401")` would false-positive on a token
+// count like "14012" and cool a healthy provider.
+export const isUnauthenticatedProviderError = (e: unknown): boolean => {
+  const m = String(e ?? "").toLowerCase();
+  return (
+    m.includes("authentication_error") ||
+    m.includes("api key is invalid") ||
+    m.includes("invalid api key") ||
+    m.includes("invalid x-api-key") ||
+    m.includes("incorrect api key") ||
+    m.includes("no llm provider configured") ||
+    m.includes("unauthorized") ||
+    m.includes("invalid_api_key") ||
+    // Standalone status code, and NOT followed by a letter. The `[^0-9]` guard
+    // the 402/429 rules use is not enough here: "finished in 401ms" satisfies it
+    // (space before, `m` after) and would cool a healthy provider on a latency
+    // line. Caught by the control below before this shipped — a unit suffix is
+    // the exact shape that slips past a digit-only boundary.
+    /(?:^|[^0-9])401(?![0-9a-z])/.test(m) ||
+    /(?:^|[^0-9])403(?![0-9a-z])/.test(m)
+  );
+};
+
+// A failover-worthy error is any of the three kinds; the cooldown length depends
+// on which.
+export const isFailoverError = (e: unknown): boolean =>
+  isExhaustedProviderError(e) || isUnreachableProviderError(e) || isUnauthenticatedProviderError(e);

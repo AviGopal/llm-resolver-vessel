@@ -38,7 +38,7 @@ import {
   VesselDaemon,
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
-import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError } from "./provider-errors.js";
+import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
 import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm } from "./model-policy.js";
 import { decideLastResort } from "./last-resort.js";
 
@@ -904,10 +904,20 @@ const isRateLimitError = (e: unknown): boolean => {
 // Grade the cooldown by cause: hard exhaustion → full window; transient
 // rate-limit → short; reachability blip → shortest. A cause that matches none of
 // these (unexpected error) defaults conservative (full window).
+// A bad credential does not heal on its own, but an operator may rotate it at
+// any moment — so the lane must rejoin rotation by itself rather than being
+// condemned for the process lifetime. Long enough that 566 futile calls a day
+// become ~4, short enough that a rotation takes effect without a restart.
+const UNAUTHENTICATED_COOLDOWN_MS =
+  parseInt(process.env.LLM_UNAUTHENTICATED_COOLDOWN_MS ?? "900000", 10);
+
 const cooldownMsFor = (e: unknown): number => {
   if (isHardExhaustedError(e)) return EXHAUSTION_COOLDOWN_MS;
   if (isRateLimitError(e)) return RATE_LIMIT_COOLDOWN_MS;
   if (isUnreachableProviderError(e)) return UNREACHABLE_COOLDOWN_MS;
+  // Checked AFTER the others: a 402/429 carrying the word "unauthorized" is a
+  // billing problem, and its cooldown should be the billing one.
+  if (isUnauthenticatedProviderError(e)) return UNAUTHENTICATED_COOLDOWN_MS;
   return EXHAUSTION_COOLDOWN_MS;
 };
 
