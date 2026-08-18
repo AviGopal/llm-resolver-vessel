@@ -1207,6 +1207,41 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
     });
     if ("refuse" in choice) {
       console.warn(`[llm-resolver-vessel] ${choice.refuse}`);
+      // A REFUSAL IS A CONCLUSION, AND IT MUST REACH THE ADVERTISEMENT GATE.
+      //
+      // decideLastResort is a pure decision function: when it refuses it has just
+      // established, against the same willingness predicate the router uses, that
+      // NOTHING here can serve a completion. That conclusion used to die in a log
+      // line. Nothing was marked exhausted, so hasCompletionQuota() never changed,
+      // so llm_completion stayed advertised by a resolver that had just said it
+      // could not serve it — violating the law stated in this repo and in
+      // development-vessel/src/index.ts:52: A RESOLVER MUST NOT ADVERTISE A SHAPE
+      // IT CANNOT SERVE.
+      //
+      // MEASURED ON A SPOKE, 2026-08-18. Local arms: ANTHROPIC_API_KEY set but
+      // 401-invalid, OPENROUTER_API_KEY valid but 402 (no credits). The openrouter
+      // MODELS cooled correctly, so clause 1 of hasCompletionQuota() went false —
+      // but clause 2 is `anthropic !== null && !inCooldown("anthropic")`, and the
+      // anthropic client is non-null whenever the KEY IS SET, validity unchecked.
+      // A 401 is neither a quota error nor a reachability error, and the lane is
+      // only cooled on the resolve path (line ~1134) which a refusal never reaches.
+      // So the gate stayed permanently open on a lane that could never answer.
+      //
+      // The cost was not local. Both hub-egress fallbacks in development-vessel
+      // (patch-with-tools.ts, llm-completion-dispatch.ts) are gated on "no llm arm
+      // is discoverable locally", and their comments name the assumption they rest
+      // on: "the local resolver de-advertises llm_completion on quota/credit
+      // exhaustion". That assumption was false, so the fallbacks never engaged and
+      // every spoke caller was routed into the dead local arm while a funded arm
+      // sat on the hub. feature_compose failed with exactly this, which is how the
+      // substrate was unable to author its own repair.
+      //
+      // Cooling the LANES (not the models) is the honest marker: the refusal is a
+      // statement about lanes, and markExhausted is monotonic, re-syncs the
+      // advertisement, and schedules its own resume — so recovery stays
+      // condition-driven and a returning key re-advertises without traffic.
+      markExhausted("anthropic");
+      markExhausted("openai");
       return { resolved: false, shape: "llmCompletion", error: choice.refuse };
     }
     return llmCompletionHandler(ctx);
