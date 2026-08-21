@@ -153,8 +153,17 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   // failover walk reaches them before the rate-limited openrouter-free / gemini
   // lanes — under load the fleet was burning all four gemini models (each 45s
   // cooling) before ever trying groq's llama-3.3, leaving the funded quota idle.
+  // Slugs verified against GET /v1/models AND a live chat completion on the
+  // funded account (2026-08-20). The previous three — llama-3.3-70b-versatile,
+  // moonshotai/kimi-k2-instruct, qwen/qwen3-32b — were ALL decommissioned by
+  // Groq: the key authenticates (200 on /models) but every completion 404s
+  // ("does not exist or you do not have access to it"). A 404 is not a failover
+  // error, so it never cooled down: all three stayed selectable, held learned
+  // posteriors, and burned a hop on every exhaustion walk while the funded quota
+  // sat idle. qwen/qwen3.6-27b is deliberately NOT here — it emits raw <think>
+  // blocks inline in `content` and nothing in this vessel strips them.
   { id: "groq", baseURL: "https://api.groq.com/openai/v1", apiKeyEnv: "GROQ_API_KEY",
-    models: ["llama-3.3-70b-versatile", "moonshotai/kimi-k2-instruct", "qwen/qwen3-32b"] },
+    models: ["openai/gpt-oss-120b", "openai/gpt-oss-20b"] },
   { id: "mistral", baseURL: "https://api.mistral.ai/v1", apiKeyEnv: "MISTRAL_API_KEY",
     models: ["mistral-small-latest", "codestral-latest", "mistral-large-latest"] },
   // OpenRouter serves arbitrary vendor/model ids - it is the catch-all for any
@@ -1382,7 +1391,7 @@ if (RUNPOD_ENDPOINT_ID && cleanEnv(process.env.RUNPOD_API_KEY)) {
 // per-Mtok cost so the cost-discount term is honest; only when the key is
 // present. Idempotent — learned alpha/beta survive restarts.
 const FUNDED_ARM_COST: Record<string, number> = {
-  "llama-3.3-70b-versatile": 0.6, "moonshotai/kimi-k2-instruct": 1.0, "qwen/qwen3-32b": 0.5,
+  "openai/gpt-oss-120b": 0.15, "openai/gpt-oss-20b": 0.075,
   "mistral-small-latest": 0.2, "codestral-latest": 0.3, "mistral-large-latest": 2.0,
   // openrouter, published per-Mtok input rates; `:free` slugs are genuinely 0 so
   // the cost-discount term prefers them and only escalates to paid when the free
