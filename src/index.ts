@@ -1307,6 +1307,7 @@ const executor = new ActivityExecutor(runtime);
 
 const resolvers = new Map<string, ResolverHandler>([
   ["llm_completion", llmCompletionWithPolicyHandler],
+  ["llmCompletion", llmCompletionWithPolicyHandler],
     ["llmCompletion", llmCompletionWithPolicyHandler],
   ["llmModelPolicy", llmModelPolicyHandler as never],
   ["llmModelPolicy_write", llmModelPolicyWriteHandler as never],
