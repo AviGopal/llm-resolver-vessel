@@ -289,6 +289,35 @@ async function syncCompletionAdvertisement(): Promise<void> {
  * hiccup must never interfere with that. It is a detector, not a dependency.
  */
 let lastPlaneDark: boolean | null = null;
+async function reportMissingKey(providerId: string, envVar: string, modelCount: number): Promise<void> {
+  try {
+    const endpoint = await resolveToolEndpoint("substrateGap_write", `${DEV_VESSEL_FALLBACK}/v2/impulses/resolve`);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (API_KEY) headers.Authorization = `ApiKey ${API_KEY}`;
+    await fetch(endpoint, {
+      method: "POST", headers,
+      body: JSON.stringify({ impulse: { 
+        type: "substrateGap_write", 
+        pointer: { 
+          type: "substrateGap_write", 
+          gap: {
+            id: `llm-provider-missing-key-${providerId}`,
+            category: "configuration",
+            source: "substrate_detected",
+            status: "open",
+            summary: `LLM provider '${providerId}' skipped - ${envVar} not set (forfeiting ${modelCount} model(s))`,
+            detected_at: new Date().toISOString()
+          }
+        } 
+      } }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    console.log(`[llm-resolver-vessel] reported missing key for provider ${providerId}`);
+  } catch (err) {
+    console.warn(`[llm-resolver-vessel] reportMissingKey failed for ${providerId} (non-fatal)`, err instanceof Error ? err.message : String(err));
+  }
+}
+
 async function reportPlaneState(): Promise<void> {
   try {
     const state = (await llmQuotaStateHandler({ body: null })).body as { providers: Record<string, ProviderState> };
@@ -340,6 +369,7 @@ for (const p of OPENAI_WIRE_PROVIDERS) {
   const key = cleanEnv(process.env[p.apiKeyEnv]) ?? p.defaultKey;
   if (!key) {
     console.warn(`[llm-resolver-vessel] OpenAI-wire provider '${p.id}' SKIPPED — ${p.apiKeyEnv} is empty; forfeiting ${p.models.length} model(s): ${p.models.join(", ")}`);
+    await reportMissingKey(p.id, p.apiKeyEnv, p.models.length);
     continue;
   }
   const client = new OpenAI({ apiKey: key, baseURL: p.baseURL });
