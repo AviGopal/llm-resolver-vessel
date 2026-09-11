@@ -368,6 +368,9 @@ for (const p of OPENAI_WIRE_PROVIDERS) {
   // is absent — a keyless vLLM ignores the token but the SDK needs a non-empty one.
   const key = cleanEnv(process.env[p.apiKeyEnv]) ?? p.defaultKey;
   if (!key) {
+        console.warn(`[llm-resolver-vessel] Wired provider '${p.id}' SKIPPED at startup — ${p.apiKeyEnv} is empty; forfeiting ${p.models.length} model(s): ${p.models.join(', ')}`);
+        await reportMissingKey(p.id, p.apiKeyEnv, p.models.length);
+
     console.warn(`[llm-resolver-vessel] OpenAI-wire provider '${p.id}' SKIPPED — ${p.apiKeyEnv} is empty; forfeiting ${p.models.length} model(s): ${p.models.join(", ")}`);
     await reportMissingKey(p.id, p.apiKeyEnv, p.models.length);
     continue;
