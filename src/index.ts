@@ -338,7 +338,10 @@ for (const p of OPENAI_WIRE_PROVIDERS) {
   // Self-hosted endpoints (defaultKey set) stay eligible even when their key env
   // is absent — a keyless vLLM ignores the token but the SDK needs a non-empty one.
   const key = cleanEnv(process.env[p.apiKeyEnv]) ?? p.defaultKey;
-  if (!key) continue;
+  if (!key) {
+    console.warn(`[llm-resolver-vessel] OpenAI-wire provider '${p.id}' SKIPPED — ${p.apiKeyEnv} is empty; forfeiting ${p.models.length} model(s): ${p.models.join(", ")}`);
+    continue;
+  }
   const client = new OpenAI({ apiKey: key, baseURL: p.baseURL });
   for (const m of p.models) modelClientMap.set(m, client);
   if (p.id === "openrouter") openrouterClient = client;
