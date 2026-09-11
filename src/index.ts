@@ -366,12 +366,9 @@ let openrouterClient: OpenAI | null = null;
 for (const p of OPENAI_WIRE_PROVIDERS) {
   // Self-hosted endpoints (defaultKey set) stay eligible even when their key env
   // is absent — a keyless vLLM ignores the token but the SDK needs a non-empty one.
-  const key = cleanEnv(process.env[p.apiKeyEnv]) ?? p.defaultKey; if (!key) { console.warn(`[llm-resolver-vessel] ${p.id} provider skipped - no API key in ${p.apiKeyEnv}`); continue; }
-  if (!key) {
-        console.warn(`[llm-resolver-vessel] Wired provider '${p.id}' SKIPPED at startup — ${p.apiKeyEnv} is empty; forfeiting ${p.models.length} model(s): ${p.models.join(', ')}`);
-        await reportMissingKey(p.id, p.apiKeyEnv, p.models.length);
-
-    console.warn(`[llm-resolver-vessel] OpenAI-wire provider '${p.id}' SKIPPED — ${p.apiKeyEnv} is empty; forfeiting ${p.models.length} model(s): ${p.models.join(", ")}`);
+  const key = cleanEnv(process.env[p.apiKeyEnv]) ?? p.defaultKey ?? '';
+  if (key === '' && !p.defaultKey) { // Skip only if no key and no defaultKey is provided
+    console.warn(`[llm-resolver-vessel] Wired provider '${p.id}' SKIPPED at startup — ${p.apiKeyEnv} is empty, and no default key is configured; forfeiting ${p.models.length} model(s): ${p.models.join(', ')}`);
     await reportMissingKey(p.id, p.apiKeyEnv, p.models.length);
     continue;
   }
