@@ -359,7 +359,7 @@ async function llmQuotaStateHandler(_ctx: { body: unknown }): Promise<{ resolved
   for (const p of OPENAI_WIRE_PROVIDERS) {
     const until = exhaustedUntil.get(p.baseURL) ?? null;
     providers[p.id] = {
-      present: !!modelClientMap.get(p.models[0] ?? ""),
+      present: modelClientMap.has(p.models[0] ?? ""),
       cooldown_until_ms: until && until > Date.now() ? until : null,
     };
   }
