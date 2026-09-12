@@ -141,8 +141,8 @@ export async function recordArmOutcome(model: string, ok: boolean, taskType?: st
   if (taskType) {
     arm.task_alpha = arm.task_alpha ?? {};
     arm.task_beta = arm.task_beta ?? {};
-    const prevTaskAlpha = arm.task_alpha[taskType] ?? arm.alpha;
-    const prevTaskBeta = arm.task_beta[taskType] ?? arm.beta;
+    const prevTaskAlpha = arm.task_alpha[taskType] ?? 1;
+    const prevTaskBeta = arm.task_beta[taskType] ?? 1;
     const decayed = decayedCounts(prevTaskAlpha, prevTaskBeta, arm.last_updated_at, now);
     const a = decayed.alpha + (ok ? 1 : 0);
     const b = decayed.beta + (ok ? 0 : 1);
