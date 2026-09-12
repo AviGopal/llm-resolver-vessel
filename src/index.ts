@@ -1352,7 +1352,15 @@ const resolvers = new Map<string, ResolverHandler>([
     ["llmCompletion", llmCompletionWithPolicyHandler],
   ["llmModelPolicy", llmModelPolicyHandler as never],
   ["llmModelPolicy_write", llmModelPolicyWriteHandler as never],
-  ["llmQuotaState", llmQuotaStateHandler as never],
+  ["llmArmOutcome_write", (async (ctx: { body: unknown }) => {
+    const b = ctx.body as { model?: string; reached?: boolean; task_type?: string };
+    if (!b || typeof b.model !== "string" || typeof b.reached !== "boolean") {
+      return { resolved: false, shape: "llmArmOutcomeWriteResult", error: "body must include model as a string and reached as a boolean" };
+    }
+    await recordArmOutcome(b.model, b.reached, b.task_type);
+    return { resolved: true, shape: "llmArmOutcomeWriteResult", body: { graded: b.model, reached: b.reached } };
+  }) as never],
+  ["llmQuotaState", (llmQuotaStateHandler) as never],
 ]);
 
 const daemon = new VesselDaemon({
