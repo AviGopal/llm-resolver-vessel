@@ -321,6 +321,14 @@ async function reportMissingKey(providerId: string, envVar: string, modelCount: 
 async function reportPlaneState(): Promise<void> {
   try {
     const state = (await llmQuotaStateHandler({ body: null })).body as { providers: Record<string, ProviderState> };
+    
+    // Report any providers skipped due to missing keys at startup
+    for (const p of OPENAI_WIRE_PROVIDERS) {
+      if (!state.providers[p.id]?.present && !cleanEnv(process.env[p.apiKeyEnv]) && !p.defaultKey) {
+        await reportMissingKey(p.id, p.apiKeyEnv, p.models.length);
+      }
+    }
+    
     const verdict = classifyPlane(state.providers ?? {}, Date.now());
 
     // Only write on a TRANSITION. A steady-state outage re-emitting on every advertisement
