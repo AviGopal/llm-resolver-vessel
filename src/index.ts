@@ -817,6 +817,9 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
     totalInputTokens += response.usage?.prompt_tokens ?? 0;
     totalOutputTokens += response.usage?.completion_tokens ?? 0;
 
+    if (!response.choices || response.choices.length === 0) {
+      throw new Error("choicesMissingFromProviderResponse");
+    }
     const choice = response.choices[0];
     if (!choice) break;
     messages.push(choice.message);
