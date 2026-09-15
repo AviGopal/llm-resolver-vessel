@@ -821,7 +821,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
     if (!response.choices || response.choices.length === 0) {
       throw new Error("choicesMissingFromProviderResponse");
     }
-    const choice = response.choices[0];
+    const choice = response.choices?.[0]; if (!choice) return { resolved: false, shape: "choicesMissingFromProviderResponse", body: { error: "Provider response missing required choices array" } };
     if (!choice) break;
     messages.push(choice.message);
 
