@@ -216,7 +216,7 @@ function loadSelfHostedVllmProviders(): OpenAiWireProvider[] {
           console.warn(`[llm-resolver-vessel] VLLM_ENDPOINTS[${i}] missing baseURL or models — skipping`);
           continue;
         }
-        out.push({ id: cleanEnv(e.id) ?? `vllm-${i}`, baseURL, models, apiKeyEnv: e.apiKeyEnv ?? "VLLM_API_KEY", defaultKey: "EMPTY" });
+                out.push({ id: cleanEnv(e.id) ?? `vllm-${i}`, baseURL, models, apiKeyEnv: e.apiKeyEnv ?? "OPENAI_API_KEY", defaultKey: "EMPTY" });
       }
     } catch (err) {
       console.warn("[llm-resolver-vessel] VLLM_ENDPOINTS is not valid JSON — ignoring", err);
@@ -229,7 +229,7 @@ function loadSelfHostedVllmProviders(): OpenAiWireProvider[] {
     if (models.length === 0) {
       console.warn("[llm-resolver-vessel] VLLM_BASE_URL set but VLLM_MODELS empty — skipping single vLLM endpoint");
     } else {
-      out.push({ id: cleanEnv(process.env.VLLM_ID) ?? "vllm", baseURL: singleBase, models, apiKeyEnv: "VLLM_API_KEY", defaultKey: "EMPTY" });
+            out.push({ id: cleanEnv(process.env.VLLM_ID) ?? "vllm", baseURL: singleBase, models, apiKeyEnv: "OPENAI_API_KEY", defaultKey: "EMPTY" });
     }
   }
   return out;
