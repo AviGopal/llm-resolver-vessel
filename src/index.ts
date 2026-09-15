@@ -1364,6 +1364,14 @@ const resolvers = new Map<string, ResolverHandler>([
     await recordArmOutcome(b.model, b.reached, b.task_type);
     return { resolved: true, shape: "llmArmOutcomeWriteResult", body: { graded: b.model, reached: b.reached } };
   }) as never],
+  ["llmArmOutcome_write", (async (ctx: { body: unknown }) => {
+    const b = ctx.body as { model?: string; reached?: boolean; task_type?: string };
+    if (!b || typeof b.model !== "string" || typeof b.reached !== "boolean") {
+      return { resolved: false, shape: "llmArmOutcomeWriteResult", error: "body must include model as a string and reached as a boolean" };
+    }
+    await recordArmOutcome(b.model, b.reached, b.task_type);
+    return { resolved: true, shape: "llmArmOutcomeWriteResult", body: { graded: b.model, reached: b.reached, task_type: b.task_type ?? null } };
+  }) as never],
   ["llmQuotaState", (llmQuotaStateHandler) as never],
 ]);
 
