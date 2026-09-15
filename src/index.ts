@@ -378,7 +378,8 @@ for (const p of OPENAI_WIRE_PROVIDERS) {
   if (key === '' && !p.defaultKey) { // Skip only if no key and no defaultKey is provided
     console.warn(`[llm-resolver-vessel] Wired provider '${p.id}' SKIPPED at startup — ${p.apiKeyEnv} is empty, and no default key is configured; forfeiting ${p.models.length} model(s): ${p.models.join(', ')}`);
     await reportMissingKey(p.id, p.apiKeyEnv, p.models.length);
-    continue;
+    // DO NOT continue; instead, initialize client with dummy key so it appears in quota state
+    // and can be reported as dark via /health, but calls to it will fail fast. 
   }
   const client = new OpenAI({ apiKey: key, baseURL: p.baseURL });
   for (const m of p.models) modelClientMap.set(m, client);
