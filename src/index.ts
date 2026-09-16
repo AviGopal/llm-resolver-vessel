@@ -289,7 +289,38 @@ async function syncCompletionAdvertisement(): Promise<void> {
  * hiccup must never interfere with that. It is a detector, not a dependency.
  */
 let lastPlaneDark: boolean | null = null;
+/**
+ * REPORT A STANDING CONDITION ONCE, NOT ONCE PER OBSERVATION.
+ *
+ * reportPlaneState() runs from syncCompletionAdvertisement(), which fires whenever the
+ * completion advertisement is re-synced — on quota changes, arm cooldowns and recoveries,
+ * not on a clock. A provider with no key is a STANDING condition, so every one of those
+ * syncs re-reported the same fact and re-wrote the same gap.
+ *
+ * The damage is not the duplicate rows, it is that the gap store is a single serialised
+ * file. Measured on a live fleet: 472 of 474 gap writes in a five-minute window were this
+ * one gap id — roughly 1.6 writes a second — while every other detector in the substrate
+ * got TWO writes between them. External gap writes timed out at 45 and 110 seconds, so the
+ * substrate's entire detection channel was effectively closed by one provider being
+ * unconfigured. The hosting vessel's resident memory grew about 3 GB in 25 minutes under it.
+ *
+ * Note the reporter immediately below this one already had exactly this guard — it keeps
+ * `lastPlaneDark` and returns when the verdict has not changed. This one is the same shape
+ * of report and was simply never given the same protection.
+ *
+ * Keyed on (provider, condition) so a provider whose key APPEARS and later disappears
+ * reports again, which is a genuine state change and must not be suppressed. A gap that is
+ * already open and unchanged needs no further writes to stay true.
+ *
+ * This is the operator's standing invariant applied at the source: identical reports should
+ * not be possible, and a condition that cannot be resolved by filing a gap must not express
+ * itself by filing one repeatedly. A missing credential is bootstrap-tier — no amount of
+ * re-filing can fix it, so the re-filing can never terminate on its own.
+ */
+const lastMissingKeyReport = new Map<string, boolean>();
 async function reportMissingKey(providerId: string, envVar: string, modelCount: number): Promise<void> {
+  if (lastMissingKeyReport.get(providerId) === true) return;
+  lastMissingKeyReport.set(providerId, true);
   try {
     const endpoint = await resolveToolEndpoint("substrateGap_write", `${DEV_VESSEL_FALLBACK}/v2/impulses/resolve`);
     const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -326,6 +357,12 @@ async function reportPlaneState(): Promise<void> {
     for (const p of OPENAI_WIRE_PROVIDERS) {
       if (!state.providers[p.id]?.present && !cleanEnv(process.env[p.apiKeyEnv]) && !p.defaultKey) {
         await reportMissingKey(p.id, p.apiKeyEnv, p.models.length);
+      } else {
+        // ARM THE REPORT AGAIN WHEN THE CONDITION CLEARS. Without this the dedup above
+        // would be a one-shot for the life of the process: a provider whose key appears and
+        // later disappears would go unreported, which is a genuine state change and exactly
+        // the case worth hearing about. Suppressing repetition must not suppress recurrence.
+        lastMissingKeyReport.delete(p.id);
       }
     }
     
