@@ -177,7 +177,9 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
              // A configured id the provider does not serve is a PHANTOM ARM: it can
              // never succeed, yet it holds a policy posterior and burns a failover hop
              // every time it is drawn. Replaced with a verified code-oriented free slug.
-             "cohere/north-mini-code:free"] },
+             "cohere/north-mini-code:free",
+             // Capable paid drafters (verified live on OpenRouter): reachable by policy selection for hard edits.
+             "google/gemini-2.5-pro", "openai/gpt-5"] },
   { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
     models: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-flash-preview"] },
   // LAST in the registry on purpose: the exhaustion failover walk reads this
