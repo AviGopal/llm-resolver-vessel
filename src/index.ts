@@ -38,6 +38,7 @@ import {
   VesselDaemon,
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
+import { unwrapPointerBody } from "./pointer-body";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
 import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm } from "./model-policy.js";
 import { decideLastResort } from "./last-resort.js";
@@ -1413,6 +1414,11 @@ const resolvers = new Map<string, ResolverHandler>([
   }) as never],
   ["llmQuotaState", (llmQuotaStateHandler) as never],
 ]);
+// Every handler reads flat fields; requests routed through discovery arrive as
+// { pointer } or { impulse: { pointer } }. Normalize once, at the router edge.
+for (const [shape, handler] of resolvers) {
+  resolvers.set(shape, (ctx: Parameters<ResolverHandler>[0]) => handler({ ...ctx, body: unwrapPointerBody(ctx.body) }));
+}
 
 const daemon = new VesselDaemon({
   port: PORT,
