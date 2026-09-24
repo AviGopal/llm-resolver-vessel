@@ -757,7 +757,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
     const toolResults: Array<{ type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }> = [];
     for (const tu of toolUses) {
       const start = Date.now();
-      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tu.name, tu.input);
+      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tu.name, { ...tu.input, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in tu.input) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) });
       toolCalls.push({ iteration: iter, tool_name: tu.name, tool_input: tu.input, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
       toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: typeof r.result === "string" ? r.result : JSON.stringify(r.result ?? r.error ?? null), ...(r.ok ? {} : { is_error: true }) });
     }
@@ -876,7 +876,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
       let toolInput: Record<string, unknown>;
       try { toolInput = JSON.parse(tc.function.arguments); } catch { toolInput = {}; }
       const start = Date.now();
-      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tc.function.name, toolInput);
+      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tc.function.name, { ...toolInput, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in toolInput) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) });
       toolCalls.push({ iteration: iter, tool_name: tc.function.name, tool_input: toolInput, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
       toolResultMessages.push({
         role: "tool",
