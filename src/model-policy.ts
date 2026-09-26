@@ -65,13 +65,23 @@ export async function loadPolicy(): Promise<ModelPolicy> {
   return policy;
 }
 
+// Saves are serialised and each writes its own temp file. Concurrent completions shared one
+// ".tmp" path, so one rename moved another writer's file away and every loser failed with
+// ENOENT: 157 arm outcomes lost in 2 minutes under load (2026-09-26), i.e. the model
+// posterior stopped learning exactly when it was busiest.
+let savePolicyChain: Promise<void> = Promise.resolve();
+
 export async function savePolicy(policy: ModelPolicy): Promise<void> {
-  policy.updated_at = new Date().toISOString();
-  await fs.mkdir(path.dirname(POLICY_PATH), { recursive: true });
-  const tmp = POLICY_PATH + ".tmp";
-  await fs.writeFile(tmp, JSON.stringify(policy, null, 2), "utf-8");
-  await fs.rename(tmp, POLICY_PATH);
-  cached = { at: Date.now(), policy };
+  const run = savePolicyChain.then(async () => {
+    policy.updated_at = new Date().toISOString();
+    await fs.mkdir(path.dirname(POLICY_PATH), { recursive: true });
+    const tmp = `${POLICY_PATH}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+    await fs.writeFile(tmp, JSON.stringify(policy, null, 2), "utf-8");
+    await fs.rename(tmp, POLICY_PATH);
+    cached = { at: Date.now(), policy };
+  });
+  savePolicyChain = run.catch(() => {});
+  return run;
 }
 
 /** Exponential decay pulling alpha and beta toward neutral prior (1,1) with 3-day half-life. */
