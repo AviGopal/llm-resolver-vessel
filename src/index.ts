@@ -266,7 +266,7 @@ async function syncCompletionAdvertisement(): Promise<void> {
   // markModelExhausted schedule a re-sync at cooldown expiry via
   // scheduleAdvertisementResume(), and a recovering provider re-syncs on the
   // success path (clearExhausted).
-  const shapes = ["llmModelPolicy", "llmModelPolicy_write", "llmQuotaState"];
+  const shapes = ["llmModelPolicy", "llmModelPolicy_write", "llmQuotaState", "llmSpendSummary"];
   if (hasCompletionQuota()) {
     shapes.unshift("llm_completion", "llmCompletion");
   } else {
@@ -570,6 +570,9 @@ interface LlmCompletionRequest {
   tool_dispatch_endpoint?: string;
   tool_dispatch_api_key?: string;
   max_tool_iterations?: number;
+  execution_id?: string;
+  dispatch_id?: string;
+  caller?: string;
 }
 
 interface ToolCallTraceEntry {
@@ -616,6 +619,11 @@ async function anthropicCreditFallback(
       resolved: true, shape: "llmCompletion", content,
       provider: "openai-wire", model: fallbackModel,
       fallback_from: "anthropic-credit",
+      usage: {
+        input_tokens: completion.usage?.prompt_tokens ?? 0,
+        output_tokens: completion.usage?.completion_tokens ?? 0,
+        ...(typeof (completion.usage as { cost?: unknown } | undefined)?.cost === "number" ? { cost_usd: (completion.usage as unknown as { cost: number }).cost } : {}),
+      },
     };
   } catch (fallbackErr) {
     console.error("[llm-resolver-vessel] fallback error:", fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr));
@@ -808,6 +816,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
         usage: {
           input_tokens: response.usage?.prompt_tokens ?? 0,
           output_tokens: response.usage?.completion_tokens ?? 0,
+          ...(typeof (response.usage as { cost?: unknown } | undefined)?.cost === "number" ? { cost_usd: (response.usage as unknown as { cost: number }).cost } : {}),
         },
         stop_reason: response.choices[0]?.finish_reason === "length" ? "max_tokens" : response.choices[0]?.finish_reason,
       };
@@ -1390,10 +1399,82 @@ const runtime = new ExecutionRuntime({
 
 const executor = new ActivityExecutor(runtime);
 
-const resolvers = new Map<string, ResolverHandler>([
-  ["llm_completion", llmCompletionWithPolicyHandler],
-  ["llmCompletion", llmCompletionWithPolicyHandler],
-    ["llmCompletion", llmCompletionWithPolicyHandler],
+// SPEND ACCOUNTING. Every completion reports usage.cost_usd: the provider-reported cost
+// when the provider sends one, else (input+output tokens)/1e6 x the serving arm's
+// cost_per_mtok. It is metered here, at the resolver-map edge, so every return path of the
+// policy handler (pinned, last-resort, selected, fallback walks) is counted exactly once.
+// Spend is aggregated IN MEMORY over a fixed window with no per-call I/O; the totals are
+// read through the llmSpendSummary shape and logged once per window roll.
+const SPEND_WINDOW_MS = 3600_000;
+interface SpendTotals { calls: number; input_tokens: number; output_tokens: number; cost_usd: number }
+interface SpendKeyTotals extends SpendTotals { model: string; provider: string; task_type: string; caller: string }
+interface SpendWindow extends SpendTotals { window_start: string; by_key: Record<string, SpendKeyTotals> }
+const newSpendWindow = (atMs: number): SpendWindow => ({ window_start: new Date(atMs).toISOString(), calls: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0, by_key: {} });
+let spendWindowStartMs = Date.now();
+let spendCurrent = newSpendWindow(spendWindowStartMs);
+let spendPrevious: SpendWindow | null = null;
+const spendSinceStart = newSpendWindow(spendWindowStartMs);
+
+function rollSpendWindow(nowMs: number): void {
+  if (nowMs - spendWindowStartMs < SPEND_WINDOW_MS) return;
+  const w = spendCurrent;
+  console.log(`[llm-spend] window ${w.window_start} calls=${w.calls} tokens_in=${w.input_tokens} tokens_out=${w.output_tokens} cost_usd=${w.cost_usd.toFixed(6)}`);
+  spendPrevious = w;
+  spendWindowStartMs = nowMs - ((nowMs - spendWindowStartMs) % SPEND_WINDOW_MS);
+  spendCurrent = newSpendWindow(spendWindowStartMs);
+}
+
+function addSpend(w: SpendWindow, k: { model: string; provider: string; task_type: string; caller: string }, inTok: number, outTok: number, cost: number): void {
+  const id = [k.model, k.provider, k.task_type, k.caller].join("|");
+  const e = w.by_key[id] ?? (w.by_key[id] = { ...k, calls: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0 });
+  for (const t of [w, e] as SpendTotals[]) {
+    t.calls += 1; t.input_tokens += inTok; t.output_tokens += outTok; t.cost_usd += cost;
+  }
+}
+
+const llmCompletionMeteredHandler: ResolverHandler = async (ctx) => {
+  const result = await llmCompletionWithPolicyHandler(ctx);
+  try {
+    const r = result as Record<string, unknown>;
+    const usage = r.usage as { input_tokens?: number; output_tokens?: number; cost_usd?: number } | undefined;
+    if (r.resolved === true && usage && typeof usage === "object") {
+      const body = ctx.body as LlmCompletionRequest;
+      const model = typeof r.model === "string" ? r.model : String(body.model ?? DEFAULT_MODEL);
+      const inTok = Number(usage.input_tokens ?? 0);
+      const outTok = Number(usage.output_tokens ?? 0);
+      if (typeof usage.cost_usd !== "number" || !Number.isFinite(usage.cost_usd)) {
+        // Wire paths strip "openai/" and "anthropic/" from the served model id; arms keep them.
+        const names = [model, "openai/" + model, "anthropic/" + model];
+        const arm = (await loadPolicy()).arms.find((a) => names.includes(a.model));
+        usage.cost_usd = ((inTok + outTok) / 1e6) * (arm?.cost_per_mtok ?? 0);
+      }
+      const key = {
+        model, provider: String(r.provider ?? "unknown"), task_type: body.task_type ?? "unknown",
+        caller: typeof body.caller === "string" && body.caller.length > 0 ? body.caller : "unknown",
+      };
+      rollSpendWindow(Date.now());
+      addSpend(spendCurrent, key, inTok, outTok, usage.cost_usd);
+      addSpend(spendSinceStart, key, inTok, outTok, usage.cost_usd);
+    }
+  } catch (err) {
+    console.warn("[llm-resolver-vessel] spend accounting failed (non-fatal)", err instanceof Error ? err.message : String(err));
+  }
+  return result;
+};
+
+const llmSpendSummaryHandler: ResolverHandler = async () => {
+  rollSpendWindow(Date.now());
+  return {
+    resolved: true, shape: "llmSpendSummary",
+    body: { window_ms: SPEND_WINDOW_MS, current: spendCurrent, previous: spendPrevious, since_start: spendSinceStart },
+  };
+};
+
+const resolvers = new Map<string, ResolverHandler> ([
+  ["llm_completion", llmCompletionMeteredHandler],
+  ["llmCompletion", llmCompletionMeteredHandler],
+    ["llmCompletion", llmCompletionMeteredHandler],
+  ["llmSpendSummary", llmSpendSummaryHandler],
   ["llmModelPolicy", llmModelPolicyHandler as never],
   ["llmModelPolicy_write", llmModelPolicyWriteHandler as never],
   ["llmArmOutcome_write", (async (ctx: { body: unknown }) => {
@@ -1424,7 +1505,7 @@ const daemon = new VesselDaemon({
   port: PORT,
   vesselId: VESSEL_ID,
   vesselName: "LLM Resolver Vessel",
-  shapes: ["llm_completion", "llmCompletion", "llmModelPolicy", "llmModelPolicy_write", "llmQuotaState"],
+  shapes: ["llm_completion", "llmCompletion", "llmModelPolicy", "llmModelPolicy_write", "llmQuotaState", "llmSpendSummary"],
   executor,
   resolvers,
   discoveryEndpoint: DISCOVERY_ENDPOINT,
