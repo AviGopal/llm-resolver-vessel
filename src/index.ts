@@ -740,6 +740,10 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   let totalCacheReadTokens = 0, totalCacheWriteTokens = 0;
 
   for (let iter = 1; iter <= maxIter; iter++) {
+    // Prompt-size ceiling per turn: tool results are appended and re-sent every turn.
+    const turnCeiling = await readMaxInputTokens();
+    const turnEstimate = estimateInputTokens(messages, body.system, body.tools);
+    if (turnEstimate > turnCeiling) return { ...promptCeilingRefusal(body, model, turnEstimate, turnCeiling, iter), tool_calls: toolCalls };
     let response;
     try {
       slideCacheBreakpoint(messages);
@@ -855,6 +859,10 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
   let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
 
   for (let iter = 1; iter <= maxIter; iter++) {
+    // Prompt-size ceiling per turn: tool results are appended and re-sent every turn.
+    const turnCeiling = await readMaxInputTokens();
+    const turnEstimate = estimateInputTokens(messages, oaiTools);
+    if (turnEstimate > turnCeiling) return { ...promptCeilingRefusal(body, model, turnEstimate, turnCeiling, iter), tool_calls: toolCalls };
     let response: OpenAI.Chat.ChatCompletion;
     try {
       response = await client.chat.completions.create({
@@ -1165,6 +1173,7 @@ const walkFallbackModels = async (
       clearExhausted(providerKeyOf(client));
       return { ...fb, fallback_from: fromModel };
     }
+    if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
     if (isFailoverError(fb.error)) markModelExhausted(fbModel, cooldownMsFor(fb.error));
   }
   return null;
@@ -1432,7 +1441,51 @@ function addSpend(w: SpendWindow, k: { model: string; provider: string; task_typ
   }
 }
 
+// PROMPT-SIZE CEILING. A completion carrying a ~800k-token prompt is refused BEFORE any provider
+// (or fallback walk) sees it: measured, five fallback calls of ~800k input tokens each were most
+// of an hour's spend. It is checked once here, at the resolver-map edge, and again before every
+// provider call inside the tool loops, whose re-sent message list grows with each tool result.
+// The ceiling is the optional max_input_tokens field of the shaped llmModelPolicy, read at use
+// time (default when absent; values under 1000 are ignored so the refusal text never carries a
+// 3-digit number that the provider-error classifiers read as an HTTP status). Input tokens are
+// estimated as characters / 4 (base64 image payloads excluded). A refusal is an ordinary failed
+// llmCompletion, so callers handle it as a failure, and it never falls back to another model.
+const DEFAULT_MAX_INPUT_TOKENS = 200_000;
+
+async function readMaxInputTokens(): Promise<number> {
+  const policy = (await loadPolicy()) as Awaited<ReturnType<typeof loadPolicy>> & { max_input_tokens?: unknown };
+  const v = policy.max_input_tokens;
+  return typeof v === "number" && Number.isFinite(v) && v >= 1000 ? v : DEFAULT_MAX_INPUT_TOKENS;
+}
+
+function estimateInputTokens(...parts: unknown[]): number {
+  let chars = 0;
+  for (const p of parts) {
+    if (p === undefined || p === null) continue;
+    chars += typeof p === "string" ? p.length : (JSON.stringify(p, (_k: string, v: unknown) =>
+      v !== null && typeof v === "object" && (v as { type?: unknown }).type === "base64" ? null : v) ?? "").length;
+  }
+  return Math.ceil(chars / 4);
+}
+
+function promptCeilingRefusal(body: LlmCompletionRequest, model: string, estimate: number, ceiling: number, turn?: number): Record<string, unknown> {
+  const turnTag = turn === undefined ? "" : ` turn=${turn}`;
+  console.warn(`[llm-resolver-vessel] prompt ceiling refused: model=${model} est_input_tokens=${estimate} ceiling=${ceiling} caller=${body.caller ?? "unknown"} task_type=${body.task_type ?? "unknown"} execution_id=${body.execution_id ?? "none"}${turnTag}`);
+  const where = turn === undefined ? "" : ` at tool-loop turn ${turn}`;
+  return {
+    resolved: false, shape: "llmCompletion", prompt_ceiling: true,
+    error: `prompt too large${where}: ~${estimate} estimated input tokens exceeds the ${ceiling}-token ceiling (llmModelPolicy.max_input_tokens); refused before the provider call, no fallback`,
+  };
+}
+
 const llmCompletionMeteredHandler: ResolverHandler = async (ctx) => {
+  const ceilingBody = (ctx.body ?? {}) as LlmCompletionRequest;
+  const entryCeiling = await readMaxInputTokens();
+  const entryEstimate = estimateInputTokens(ceilingBody.prompt, ceilingBody.system, ceilingBody.tools);
+  if (entryEstimate > entryCeiling) {
+    const entryModel = typeof ceilingBody.model === "string" && ceilingBody.model.length > 0 ? ceilingBody.model : "auto";
+    return promptCeilingRefusal(ceilingBody, entryModel, entryEstimate, entryCeiling);
+  }
   const result = await llmCompletionWithPolicyHandler(ctx);
   try {
     const r = result as Record<string, unknown>;
