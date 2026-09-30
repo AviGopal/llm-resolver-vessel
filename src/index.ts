@@ -39,6 +39,7 @@ import {
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
+import { offeredToolNames, toolPointer } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
 import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm } from "./model-policy.js";
 import { decideLastResort } from "./last-resort.js";
@@ -513,8 +514,11 @@ async function dispatchTool(
   apiKey: string,
   toolName: string,
   toolInput: Record<string, unknown>,
+  offered: ReadonlySet<string>,
 ): Promise<{ ok: boolean; result: unknown; error?: string }> {
-  const pointer = { type: toolName, ...toolInput };
+  // Only a tool the request offered is dispatched, and its type is never the model's to choose (see tool-dispatch.ts).
+  if (!offered.has(toolName)) return { ok: false, result: null, error: `tool '${toolName}' was not offered in this request` };
+  const pointer = toolPointer(toolName, toolInput);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 60_000);
   try {
@@ -723,6 +727,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   const dispatchApiKey = body.tool_dispatch_api_key ?? process.env.METABOB_API_KEY ?? "";
   const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
   const hasClientSideTools = body.tools.some((t) => !t.type || t.type === "custom");
+  const offered = offeredToolNames(body.tools);
   if (hasClientSideTools && !dispatchApiKey) {
     return { resolved: false, shape: "llmCompletion", error: "tool-use with client-side tools requires METABOB_API_KEY" };
   }
@@ -769,7 +774,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
     const toolResults: Array<{ type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }> = [];
     for (const tu of toolUses) {
       const start = Date.now();
-      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tu.name, { ...tu.input, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in tu.input) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) });
+      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tu.name, { ...tu.input, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in tu.input) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) }, offered);
       toolCalls.push({ iteration: iter, tool_name: tu.name, tool_input: tu.input, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
       toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: typeof r.result === "string" ? r.result : JSON.stringify(r.result ?? r.error ?? null), ...(r.ok ? {} : { is_error: true }) });
     }
@@ -840,6 +845,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
   }
 
   // Convert Anthropic-style tool defs to OpenAI format
+  const offered = offeredToolNames(body.tools);
   const oaiTools: OpenAI.Chat.ChatCompletionTool[] = body.tools
     .filter((t) => !t.type || t.type === "custom")
     .map((t) => ({
@@ -893,7 +899,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
       let toolInput: Record<string, unknown>;
       try { toolInput = JSON.parse(tc.function.arguments); } catch { toolInput = {}; }
       const start = Date.now();
-      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tc.function.name, { ...toolInput, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in toolInput) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) });
+      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tc.function.name, { ...toolInput, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in toolInput) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) }, offered);
       toolCalls.push({ iteration: iter, tool_name: tc.function.name, tool_input: toolInput, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
       toolResultMessages.push({
         role: "tool",
