@@ -39,7 +39,7 @@ import {
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
-import { offeredToolNames, toolPointer } from "./tool-dispatch";
+import { offeredToolNames, toolPointer, withDispatchExecutionId } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
 import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
@@ -800,7 +800,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
     const toolResults: Array<{ type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }> = [];
     for (const tu of toolUses) {
       const start = Date.now();
-      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tu.name, { ...tu.input, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in tu.input) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) }, offered);
+      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tu.name, withDispatchExecutionId(tu.input, (body as { execution_id?: unknown }).execution_id), offered);
       toolCalls.push({ iteration: iter, tool_name: tu.name, tool_input: tu.input, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
       toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: toolResultBudget.bound(tu.name, tu.input, r), ...(r.ok ? {} : { is_error: true }) });
     }
@@ -942,7 +942,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
       let toolInput: Record<string, unknown>;
       try { toolInput = JSON.parse(tc.function.arguments); } catch { toolInput = {}; }
       const start = Date.now();
-      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tc.function.name, { ...toolInput, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in toolInput) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) }, offered);
+      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tc.function.name, withDispatchExecutionId(toolInput, (body as { execution_id?: unknown }).execution_id), offered);
       toolCalls.push({ iteration: iter, tool_name: tc.function.name, tool_input: toolInput, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
       toolResultMessages.push({
         role: "tool",

@@ -24,3 +24,16 @@ export function toolPointer(toolName: string, toolInput: Record<string, unknown>
 export function offeredToolNames(tools: ReadonlyArray<{ name: string; type?: string }> | undefined): Set<string> {
   return new Set((tools ?? []).filter((t) => !t.type || t.type === "custom").map((t) => t.name));
 }
+
+/**
+ * The dispatcher, not the model, owns a tool call's attribution too. A tool call's execution_id was the
+ * dispatch's only when the model had not written one (`!("execution_id" in input)`), so a model-supplied
+ * value won: a call could be attributed to another dispatch, or escape goal-host's floor-lineage
+ * recursion guard, which reads it. The dispatch's id now always wins; with no dispatch id, a
+ * model-written one is dropped rather than trusted.
+ */
+export function withDispatchExecutionId(toolInput: Record<string, unknown>, dispatchExecutionId: unknown): Record<string, unknown> {
+  const input = typeof toolInput === "object" && toolInput !== null && !Array.isArray(toolInput) ? toolInput : {};
+  const { execution_id: _modelId, ...args } = input;
+  return typeof dispatchExecutionId === "string" && dispatchExecutionId ? { ...args, execution_id: dispatchExecutionId } : args;
+}
