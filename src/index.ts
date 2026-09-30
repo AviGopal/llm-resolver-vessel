@@ -41,7 +41,9 @@ import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { offeredToolNames, toolPointer } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
-import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm } from "./model-policy.js";
+import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
+import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
+import { ToolResultBudget } from "./tool-result-bound.js";
 import { decideLastResort } from "./last-resort.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -613,11 +615,18 @@ async function anthropicCreditFallback(
     const messages: Array<{ role: "system" | "user"; content: string }> = [];
     if (body.system) messages.push({ role: "system", content: body.system });
     messages.push({ role: "user", content: body.prompt ?? "" });
-    const completion = await client.chat.completions.create({
-      model: fallbackModel,
-      max_tokens: body.max_tokens ?? DEFAULT_MAX_TOKENS,
-      messages,
+    const budgeted = await budgetedProviderCall({
+      ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: estimateInputTokens(messages),
+      readCap: readMaxInputTokensPerDispatch,
+      call: () => client.chat.completions.create({
+        model: fallbackModel,
+        max_tokens: body.max_tokens ?? DEFAULT_MAX_TOKENS,
+        messages,
+      }),
+      inputTokensOf: (c) => c.usage?.prompt_tokens ?? 0,
     });
+    if ("refused" in budgeted) return dispatchBudgetRefusal(body, fallbackModel, budgeted.refused);
+    const completion = budgeted.response;
     const content = completion.choices?.[0]?.message?.content ?? "";
     return {
       resolved: true, shape: "llmCompletion", content,
@@ -693,11 +702,18 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
 
   if (!body.tools || body.tools.length === 0) {
     try {
-      const response = await anthropic.messages.create({
-        model, max_tokens: maxTokens,
-        ...cachedSystem(body.system),
-        messages: [{ role: "user", content: userContent }],
+      const budgeted = await budgetedProviderCall({
+        ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: estimateInputTokens(body.system, userContent),
+        readCap: readMaxInputTokensPerDispatch,
+        call: () => anthropic!.messages.create({
+          model, max_tokens: maxTokens,
+          ...cachedSystem(body.system),
+          messages: [{ role: "user", content: userContent }],
+        }),
+        inputTokensOf: anthropicInputTokens,
       });
+      if ("refused" in budgeted) return dispatchBudgetRefusal(body, model, budgeted.refused);
+      const response = budgeted.response;
       const content = response.content
         .filter((b) => b.type === "text")
         .map((b) => (b as { type: "text"; text: string }).text)
@@ -743,6 +759,8 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   const toolCalls: ToolCallTraceEntry[] = [];
   let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
   let totalCacheReadTokens = 0, totalCacheWriteTokens = 0;
+  // Every tool result is re-sent on every later turn: bound each one and their per-request total.
+  const toolResultBudget = new ToolResultBudget(await readToolResultLimits());
 
   for (let iter = 1; iter <= maxIter; iter++) {
     // Prompt-size ceiling per turn: tool results are appended and re-sent every turn.
@@ -752,12 +770,20 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
     let response;
     try {
       slideCacheBreakpoint(messages);
-      response = await anthropic.messages.create({
-        model, max_tokens: maxTokens,
-        tools: body.tools as unknown as Anthropic.Messages.Tool[],
-        ...cachedSystem(body.system),
-        messages: messages as unknown as Anthropic.Messages.MessageParam[],
+      // Dispatch budget per turn: checked (and the estimate reserved) BEFORE the provider call.
+      const budgeted = await budgetedProviderCall({
+        ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: turnEstimate,
+        readCap: readMaxInputTokensPerDispatch,
+        call: () => anthropic!.messages.create({
+          model, max_tokens: maxTokens,
+          tools: body.tools as unknown as Anthropic.Messages.Tool[],
+          ...cachedSystem(body.system),
+          messages: messages as unknown as Anthropic.Messages.MessageParam[],
+        }),
+        inputTokensOf: anthropicInputTokens,
       });
+      if ("refused" in budgeted) return { ...dispatchBudgetRefusal(body, model, budgeted.refused, iter), tool_calls: toolCalls, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens } };
+      response = budgeted.response;
     } catch (err) {
       return { resolved: false, shape: "llmCompletion", error: `anthropic (iter ${iter}): ${err instanceof Error ? err.message : String(err)}`, tool_calls: toolCalls };
     }
@@ -776,7 +802,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
       const start = Date.now();
       const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tu.name, { ...tu.input, ...(typeof (body as { execution_id?: unknown }).execution_id === "string" && !("execution_id" in tu.input) ? { execution_id: (body as { execution_id?: string }).execution_id } : {}) }, offered);
       toolCalls.push({ iteration: iter, tool_name: tu.name, tool_input: tu.input, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
-      toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: typeof r.result === "string" ? r.result : JSON.stringify(r.result ?? r.error ?? null), ...(r.ok ? {} : { is_error: true }) });
+      toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: toolResultBudget.bound(tu.name, tu.input, r), ...(r.ok ? {} : { is_error: true }) });
     }
     messages.push({ role: "user", content: toolResults });
   }
@@ -813,11 +839,18 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
 
   if (!body.tools || body.tools.length === 0) {
     try {
-      const response = await client.chat.completions.create({
-        model,
-        max_tokens: maxTokens,
-        messages: [...systemMessages, { role: "user", content: body.prompt }],
+      const budgeted = await budgetedProviderCall({
+        ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: estimateInputTokens(systemMessages, body.prompt),
+        readCap: readMaxInputTokensPerDispatch,
+        call: () => client.chat.completions.create({
+          model,
+          max_tokens: maxTokens,
+          messages: [...systemMessages, { role: "user", content: body.prompt }],
+        }),
+        inputTokensOf: (c) => c.usage?.prompt_tokens ?? 0,
       });
+      if ("refused" in budgeted) return dispatchBudgetRefusal(body, model, budgeted.refused);
+      const response = budgeted.response;
       const content = response.choices[0]?.message?.content ?? "";
       return {
         resolved: true, shape: "llmCompletion", content,
@@ -863,6 +896,8 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
   ];
   const toolCalls: ToolCallTraceEntry[] = [];
   let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
+  // Every tool result is re-sent on every later turn: bound each one and their per-request total.
+  const toolResultBudget = new ToolResultBudget(await readToolResultLimits());
 
   for (let iter = 1; iter <= maxIter; iter++) {
     // Prompt-size ceiling per turn: tool results are appended and re-sent every turn.
@@ -871,10 +906,18 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
     if (turnEstimate > turnCeiling) return { ...promptCeilingRefusal(body, model, turnEstimate, turnCeiling, iter), tool_calls: toolCalls };
     let response: OpenAI.Chat.ChatCompletion;
     try {
-      response = await client.chat.completions.create({
-        model, max_tokens: maxTokens, messages,
-        ...(oaiTools.length > 0 ? { tools: oaiTools } : {}),
+      // Dispatch budget per turn: checked (and the estimate reserved) BEFORE the provider call.
+      const budgeted = await budgetedProviderCall({
+        ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: turnEstimate,
+        readCap: readMaxInputTokensPerDispatch,
+        call: () => client.chat.completions.create({
+          model, max_tokens: maxTokens, messages,
+          ...(oaiTools.length > 0 ? { tools: oaiTools } : {}),
+        }),
+        inputTokensOf: (c) => c.usage?.prompt_tokens ?? 0,
       });
+      if ("refused" in budgeted) return { ...dispatchBudgetRefusal(body, model, budgeted.refused, iter), tool_calls: toolCalls, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens } };
+      response = budgeted.response;
     } catch (err) {
       return { resolved: false, shape: "llmCompletion", error: `openai (iter ${iter}): ${err instanceof Error ? err.message : String(err)}`, tool_calls: toolCalls };
     }
@@ -904,7 +947,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
       toolResultMessages.push({
         role: "tool",
         tool_call_id: tc.id,
-        content: typeof r.result === "string" ? r.result : JSON.stringify(r.result ?? r.error ?? null),
+        content: toolResultBudget.bound(tc.function.name, toolInput, r),
       });
     }
     messages.push(...toolResultMessages);
@@ -1180,6 +1223,7 @@ const walkFallbackModels = async (
       return { ...fb, fallback_from: fromModel };
     }
     if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
+    if (fb.dispatch_budget_exhausted === true) return fb; // the dispatch's allowance is spent for every model too
     if (isFailoverError(fb.error)) markModelExhausted(fbModel, cooldownMsFor(fb.error));
   }
   return null;
@@ -1393,7 +1437,9 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
     // genuinely bad still earns its beta from calls that actually ran.
     const armFailed = (result as { resolved?: boolean }).resolved !== true;
     const providerLevelFailure = armFailed && isFailoverError((result as { error?: unknown }).error);
-    if (!DRAFTING_TASK_TYPES.has(body.task_type ?? "") && !providerLevelFailure) {
+    // A dispatch-budget refusal says the DISPATCH spent its allowance, not that the model answered badly.
+    const budgetRefusal = (result as { dispatch_budget_exhausted?: unknown }).dispatch_budget_exhausted === true;
+    if (!DRAFTING_TASK_TYPES.has(body.task_type ?? "") && !providerLevelFailure && !budgetRefusal) {
       await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true, body.task_type);
     } else if (providerLevelFailure) {
       console.log(
@@ -1458,6 +1504,17 @@ function addSpend(w: SpendWindow, k: { model: string; provider: string; task_typ
 // llmCompletion, so callers handle it as a failure, and it never falls back to another model.
 const DEFAULT_MAX_INPUT_TOKENS = 200_000;
 
+// PER-DISPATCH BUDGET (see dispatch-budget.ts). The per-turn ceiling above bounds one provider
+// call; this bounds the input tokens one dispatch sends across every turn of every call, read
+// from llmModelPolicy.max_input_tokens_per_dispatch. Charged at each provider call site.
+const dispatchLedger = new DispatchLedger();
+
+// Anthropic reports cached prompt tokens separately from input_tokens; all of them were sent.
+function anthropicInputTokens(r: { usage: unknown }): number {
+  const u = (r.usage ?? {}) as { input_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
+  return (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0);
+}
+
 async function readMaxInputTokens(): Promise<number> {
   const policy = (await loadPolicy()) as Awaited<ReturnType<typeof loadPolicy>> & { max_input_tokens?: unknown };
   const v = policy.max_input_tokens;
@@ -1492,6 +1549,15 @@ const llmCompletionMeteredHandler: ResolverHandler = async (ctx) => {
     const entryModel = typeof ceilingBody.model === "string" && ceilingBody.model.length > 0 ? ceilingBody.model : "auto";
     return promptCeilingRefusal(ceilingBody, entryModel, entryEstimate, entryCeiling);
   }
+  // Per-dispatch budget at entry: a dispatch that has already spent its allowance is refused here,
+  // before model selection. Requests without an id are counted by caller (they are not budgeted).
+  const entryKey = dispatchKeyOf(ceilingBody);
+  if (entryKey === null) {
+    dispatchLedger.noteMissingId(typeof ceilingBody.caller === "string" ? ceilingBody.caller : "unknown");
+  } else {
+    const over = checkDispatchBudget(dispatchLedger, entryKey, entryEstimate, await readMaxInputTokensPerDispatch());
+    if (over) return dispatchBudgetRefusal(ceilingBody, typeof ceilingBody.model === "string" && ceilingBody.model.length > 0 ? ceilingBody.model : "auto", over);
+  }
   const result = await llmCompletionWithPolicyHandler(ctx);
   try {
     const r = result as Record<string, unknown>;
@@ -1525,7 +1591,7 @@ const llmSpendSummaryHandler: ResolverHandler = async () => {
   rollSpendWindow(Date.now());
   return {
     resolved: true, shape: "llmSpendSummary",
-    body: { window_ms: SPEND_WINDOW_MS, current: spendCurrent, previous: spendPrevious, since_start: spendSinceStart },
+    body: { window_ms: SPEND_WINDOW_MS, current: spendCurrent, previous: spendPrevious, since_start: spendSinceStart, dispatch_budget: { ...dispatchLedger.snapshot(), cap_input_tokens: await readMaxInputTokensPerDispatch() } },
   };
 };
 

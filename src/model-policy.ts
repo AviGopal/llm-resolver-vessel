@@ -31,6 +31,70 @@ export interface ModelPolicy {
   updated_at: string;
   cost_weight: number;
   arms: PolicyArm[];
+  /** Per-turn prompt ceiling (value-per-cost 1.6); read in index.ts. */
+  max_input_tokens?: number;
+  /** Input tokens one dispatch (dispatch_id, else execution_id) may send across ALL its turns and
+   * calls before llm-resolver refuses further provider calls for it. See dispatch-budget.ts. */
+  max_input_tokens_per_dispatch?: number;
+  /** Longest a single tool result may enter a tool loop's message list. See tool-result-bound.ts. */
+  tool_result_max_chars?: number;
+  /** Total tool-result characters one request's tool loop may add across all its turns. */
+  tool_results_total_max_chars?: number;
+}
+
+/**
+ * Values a policy field takes when the stored policy does not set it. The stored policy file
+ * predates these fields, so the defaults are applied at READ time, not seeded into the file.
+ *
+ * max_input_tokens_per_dispatch = 400k, from the spend summary of 2026-09-30 15:40-16:40 UTC across
+ * both nodes: legitimate per-call input was feature_compose ~24k, patch_with_tools <= ~4.1k,
+ * floor_tool_loop normally 5-10k (one 231k gpt-4o-mini outlier), everything else < 8k. 400k clears
+ * the largest legitimate call ~16x and the 231k outlier, yet stops a runaway floor loop at about a
+ * quarter of one observed 1.58M-token call: ~0.24 USD at the observed gpt-5 rate (1.906 USD /
+ * 3.16M input tokens), ~12% of the fleet's 2 USD/h spend envelope instead of ~95%.
+ */
+/*
+ * tool_result_max_chars = 16k chars (~4k tokens) and tool_results_total_max_chars = 64k chars
+ * (~16k tokens) per request. In the same hour a normal floor_tool_loop call used 5-10k input
+ * tokens IN TOTAL (prompt, every turn and every tool result), so 16k tokens of tool results clears
+ * normal use while holding the re-sent list far under the 200k-token per-turn ceiling (~800k chars).
+ * 16k chars is ~400 lines of source: enough to orient, after which the model is told to re-call
+ * narrower. A single 525k-char result used to enter whole (~131k tokens, re-sent every turn).
+ */
+export const POLICY_DEFAULTS = {
+  max_input_tokens_per_dispatch: 400_000,
+  tool_result_max_chars: 16_000,
+  tool_results_total_max_chars: 64_000,
+} as const;
+
+/** The numeric policy fields that fall back to POLICY_DEFAULTS and are writable via llmModelPolicy_write. */
+export type DefaultedPolicyField = keyof typeof POLICY_DEFAULTS;
+const DEFAULTED_FIELDS = Object.keys(POLICY_DEFAULTS) as DefaultedPolicyField[];
+
+/** A defaulted field's value in force: the policy's when it is a finite number >= 1000 (smaller
+ * values are ignored so refusal text never carries a 3-digit number that the provider-error
+ * classifiers read as an HTTP status), else POLICY_DEFAULTS. */
+export function effectivePolicyValue(policy: Partial<Pick<ModelPolicy, DefaultedPolicyField>>, field: DefaultedPolicyField): number {
+  const v = policy[field];
+  return typeof v === "number" && Number.isFinite(v) && v >= 1000 ? v : POLICY_DEFAULTS[field];
+}
+
+export function effectiveMaxInputTokensPerDispatch(policy: Pick<ModelPolicy, "max_input_tokens_per_dispatch">): number {
+  return effectivePolicyValue(policy, "max_input_tokens_per_dispatch");
+}
+
+/** Tool-result allowances in force for one request (read once at the start of a tool loop). */
+export async function readToolResultLimits(): Promise<{ per_result_max_chars: number; total_max_chars: number }> {
+  const policy = await loadPolicy();
+  return {
+    per_result_max_chars: effectivePolicyValue(policy, "tool_result_max_chars"),
+    total_max_chars: effectivePolicyValue(policy, "tool_results_total_max_chars"),
+  };
+}
+
+/** Read at use time (loadPolicy's 10 s cache; a policy write refreshes it immediately). */
+export async function readMaxInputTokensPerDispatch(): Promise<number> {
+  return effectiveMaxInputTokensPerDispatch(await loadPolicy());
 }
 
 const POLICY_PATH = path.join(process.env.WORKSPACE_ROOT ?? "/workspace", "policies", "llm-model-policy.json");
@@ -284,17 +348,35 @@ export async function recordArmOutcomeFromPending(executionId: string, reached: 
   await rename(tmp, PENDING_ARM_OUTCOMES_PATH);
 }
 
-export async function llmModelPolicyHandler(): Promise<{ resolved: boolean; shape: string; body: ModelPolicy }> {
-  return { resolved: true, shape: "llmModelPolicy", body: await loadPolicy() };
+function effectiveDefaultedValues(policy: ModelPolicy): Record<string, number> {
+  return Object.fromEntries(DEFAULTED_FIELDS.map((f) => [f, effectivePolicyValue(policy, f)]));
+}
+
+export async function llmModelPolicyHandler(): Promise<{ resolved: boolean; shape: string; body: ModelPolicy & { effective: Record<string, number> } }> {
+  const policy = await loadPolicy();
+  // `effective` shows the value in force for fields the stored policy leaves unset (defaults).
+  return { resolved: true, shape: "llmModelPolicy", body: { ...policy, effective: effectiveDefaultedValues(policy) } };
 }
 
 export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body?: unknown; error?: string }> {
-  const req = ctx.body as { arms?: PolicyArm[]; cost_weight?: number; merge?: boolean };
-  if (!req || (!Array.isArray(req.arms) && typeof req.cost_weight !== "number")) {
-    return { resolved: false, shape: "llmModelPolicyWriteResult", error: "body must include arms[] and/or cost_weight" };
+  const req = ctx.body as { arms?: PolicyArm[]; cost_weight?: number; merge?: boolean } & Partial<Record<DefaultedPolicyField, number | null>>;
+  const fields = req != null && typeof req === "object" ? DEFAULTED_FIELDS.filter((f) => f in req) : [];
+  if (!req || (!Array.isArray(req.arms) && typeof req.cost_weight !== "number" && fields.length === 0)) {
+    return { resolved: false, shape: "llmModelPolicyWriteResult", error: `body must include arms[], cost_weight and/or one of ${DEFAULTED_FIELDS.join(", ")}` };
+  }
+  for (const f of fields) {
+    const v = req[f];
+    if (v !== null && !(typeof v === "number" && Number.isFinite(v) && v >= 1000)) {
+      return { resolved: false, shape: "llmModelPolicyWriteResult", error: `${f} must be a number >= 1000, or null to use the default` };
+    }
   }
   const policy = await loadPolicy();
   if (typeof req.cost_weight === "number") policy.cost_weight = req.cost_weight;
+  for (const f of fields) {
+    const v = req[f];
+    if (v === null || v === undefined) delete policy[f];
+    else policy[f] = v;
+  }
   if (Array.isArray(req.arms)) {
     if (req.merge === false) {
       policy.arms = req.arms;
@@ -308,5 +390,5 @@ export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promis
   }
   policy.rev += 1;
   await savePolicy(policy);
-  return { resolved: true, shape: "llmModelPolicyWriteResult", body: { rev: policy.rev, arm_count: policy.arms.length } };
+  return { resolved: true, shape: "llmModelPolicyWriteResult", body: { rev: policy.rev, arm_count: policy.arms.length, effective: effectiveDefaultedValues(policy) } };
 }
