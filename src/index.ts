@@ -39,7 +39,7 @@ import {
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
-import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall } from "./tool-dispatch";
+import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall, type ToolDispatchRoute } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
 import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
@@ -328,7 +328,7 @@ async function reportMissingKey(providerId: string, envVar: string, modelCount: 
   if (lastMissingKeyReport.get(providerId) === true) return;
   lastMissingKeyReport.set(providerId, true);
   try {
-    const endpoint = await resolveToolEndpoint("substrateGap_write", `${DEV_VESSEL_FALLBACK}/v2/impulses/resolve`);
+    const endpoint = (await resolveToolEndpoint("substrateGap_write", `${DEV_VESSEL_FALLBACK}/v2/impulses/resolve`)).url;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (API_KEY) headers.Authorization = `ApiKey ${API_KEY}`;
     await fetch(endpoint, {
@@ -380,7 +380,7 @@ async function reportPlaneState(): Promise<void> {
     if (lastPlaneDark === verdict.dark) return;
     lastPlaneDark = verdict.dark;
 
-    const endpoint = await resolveToolEndpoint("substrateGap_write", `${DEV_VESSEL_FALLBACK}/v2/impulses/resolve`);
+    const endpoint = (await resolveToolEndpoint("substrateGap_write", `${DEV_VESSEL_FALLBACK}/v2/impulses/resolve`)).url;
     const gap = verdict.dark
       ? { id: verdict.id, category: "infrastructure", source: "substrate_detected", status: "open", summary: verdict.summary, detected_at: new Date().toISOString() }
       : { id: "llm-completion-plane-dark", category: "infrastructure", source: "substrate_detected", status: "closed", summary: `[closed] The LLM completion plane recovered — ${verdict.reason}.`, detected_at: new Date().toISOString() };
@@ -478,13 +478,12 @@ const DEFAULT_MAX_TOOL_ITERATIONS = parseInt(process.env.LLM_MAX_TOOL_ITERATIONS
 const resolveToolEndpoint = makeToolEndpointResolver(DISCOVERY_ENDPOINT, API_KEY);
 
 async function dispatchTool(
-  endpoint: string,
-  apiKey: string,
+  route: ToolDispatchRoute,
   toolName: string,
   toolInput: Record<string, unknown>,
   offered: ReadonlySet<string>,
 ): Promise<{ ok: boolean; result: unknown; error?: string }> {
-  return dispatchToolCall(resolveToolEndpoint, endpoint, apiKey, toolName, toolInput, offered);
+  return dispatchToolCall(resolveToolEndpoint, route, toolName, toolInput, offered);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -675,7 +674,9 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   }
 
   // Tool-use loop (Anthropic)
-  const { endpoint: dispatchEndpoint, apiKey: dispatchApiKey } = toolDispatchRoute(body, DEFAULT_TOOL_DISPATCH_ENDPOINT, process.env.METABOB_API_KEY);
+  // The node key goes only to the configured or a discovered endpoint, never to body.tool_dispatch_endpoint.
+  const dispatchRoute = toolDispatchRoute(body, DEFAULT_TOOL_DISPATCH_ENDPOINT, process.env.METABOB_API_KEY);
+  const dispatchApiKey = dispatchRoute.apiKey;
   const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
   const hasClientSideTools = body.tools.some((t) => !t.type || t.type === "custom");
   const offered = offeredToolNames(body.tools);
@@ -735,7 +736,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
     const toolResults: Array<{ type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }> = [];
     for (const tu of toolUses) {
       const start = Date.now();
-      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tu.name, withDispatchExecutionId(tu.input, (body as { execution_id?: unknown }).execution_id), offered);
+      const r = await dispatchTool(dispatchRoute, tu.name, withDispatchExecutionId(tu.input, (body as { execution_id?: unknown }).execution_id), offered);
       toolCalls.push({ iteration: iter, tool_name: tu.name, tool_input: tu.input, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
       toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: toolResultBudget.bound(tu.name, tu.input, r), ...(r.ok ? {} : { is_error: true }) });
     }
@@ -805,7 +806,9 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
   }
 
   // Tool-use loop (OpenAI format)
-  const { endpoint: dispatchEndpoint, apiKey: dispatchApiKey } = toolDispatchRoute(body, DEFAULT_TOOL_DISPATCH_ENDPOINT, process.env.METABOB_API_KEY);
+  // The node key goes only to the configured or a discovered endpoint, never to body.tool_dispatch_endpoint.
+  const dispatchRoute = toolDispatchRoute(body, DEFAULT_TOOL_DISPATCH_ENDPOINT, process.env.METABOB_API_KEY);
+  const dispatchApiKey = dispatchRoute.apiKey;
   const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
   if (!dispatchApiKey) {
     return { resolved: false, shape: "llmCompletion", error: "tool-use requires METABOB_API_KEY" };
@@ -876,7 +879,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
       let toolInput: Record<string, unknown>;
       try { toolInput = JSON.parse(tc.function.arguments); } catch { toolInput = {}; }
       const start = Date.now();
-      const r = await dispatchTool(dispatchEndpoint, dispatchApiKey, tc.function.name, withDispatchExecutionId(toolInput, (body as { execution_id?: unknown }).execution_id), offered);
+      const r = await dispatchTool(dispatchRoute, tc.function.name, withDispatchExecutionId(toolInput, (body as { execution_id?: unknown }).execution_id), offered);
       toolCalls.push({ iteration: iter, tool_name: tc.function.name, tool_input: toolInput, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
       toolResultMessages.push({
         role: "tool",

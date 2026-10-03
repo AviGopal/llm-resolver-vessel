@@ -32,7 +32,7 @@ afterEach(() => {
 
 function recordingFetch(discoveryAnswers: boolean): Seen[] {
   const seen: Seen[] = [];
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
     seen.push({ url, authorization: new Headers(init?.headers ?? {}).get("authorization") });
     if (url.startsWith(DISCOVERY)) {
@@ -51,7 +51,7 @@ async function send(
   body: { tool_dispatch_endpoint?: string; tool_dispatch_api_key?: string },
 ): Promise<void> {
   const route = toolDispatchRoute(body, CONFIGURED, NODE_KEY);
-  await dispatchToolCall(resolve, route.endpoint, route.apiKey, "web_search", { query: "q" }, new Set(["web_search"]));
+  await dispatchToolCall(resolve, route, "web_search", { query: "q" }, new Set(["web_search"]));
 }
 
 const toolCalls = (seen: Seen[]) => seen.filter((s) => !s.url.startsWith(DISCOVERY));

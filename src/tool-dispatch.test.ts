@@ -64,7 +64,7 @@ describe("both tool-use loops dispatch through the guard", () => {
     expect(refuse).toBeLessThan(body.indexOf("resolveToolEndpoint("));
     // and by behaviour: the endpoint lookup never runs for an unoffered tool
     let looked = 0;
-    const r = await dispatchToolCall(async () => { looked++; return "http://x"; }, "http://x", "k", "shell", {}, new Set(["web_search"]));
+    const r = await dispatchToolCall(async () => { looked++; return { url: "http://x", via: "fallback" as const }; }, { endpoint: "http://x", nodeKey: "k", apiKey: "k" }, "shell", {}, new Set(["web_search"]));
     expect(r.ok).toBe(false);
     expect(looked).toBe(0);
   });
