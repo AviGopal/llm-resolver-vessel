@@ -39,7 +39,7 @@ import {
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
-import { offeredToolNames, toolPointer, withDispatchExecutionId } from "./tool-dispatch";
+import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
 import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
@@ -475,41 +475,7 @@ const DEFAULT_TOOL_DISPATCH_ENDPOINT =
   process.env.LLM_TOOL_DISPATCH_ENDPOINT ?? "http://127.0.0.1:8090/v2/impulses/resolve";
 const DEFAULT_MAX_TOOL_ITERATIONS = parseInt(process.env.LLM_MAX_TOOL_ITERATIONS ?? "20", 10);
 
-const TOOL_ENDPOINT_CACHE = new Map<string, string>();
-
-async function resolveToolEndpoint(toolName: string, fallback: string): Promise<string> {
-  const cached = TOOL_ENDPOINT_CACHE.get(toolName);
-  if (cached) return cached;
-  try {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (API_KEY) headers.Authorization = `ApiKey ${API_KEY}`;
-    const res = await fetch(`${DISCOVERY_ENDPOINT}/resolve`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ pointer: { type: "vesselCapability", shape: toolName } }),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) {
-      TOOL_ENDPOINT_CACHE.set(toolName, fallback);
-      return fallback;
-    }
-    const body = (await res.json()) as { content?: { vessels?: Array<{ endpoint?: string; resolve_endpoint?: string }> } };
-    const vessel = body?.content?.vessels?.[0];
-    if (!vessel || !vessel.endpoint || !vessel.resolve_endpoint) {
-      TOOL_ENDPOINT_CACHE.set(toolName, fallback);
-      return fallback;
-    }
-    const re = vessel.resolve_endpoint;
-    const url = re.startsWith("http://") || re.startsWith("https://")
-      ? re
-      : `${vessel.endpoint.replace(/\/$/, "")}${re.startsWith("/") ? re : "/" + re}`;
-    TOOL_ENDPOINT_CACHE.set(toolName, url);
-    return url;
-  } catch {
-    TOOL_ENDPOINT_CACHE.set(toolName, fallback);
-    return fallback;
-  }
-}
+const resolveToolEndpoint = makeToolEndpointResolver(DISCOVERY_ENDPOINT, API_KEY);
 
 async function dispatchTool(
   endpoint: string,
@@ -518,37 +484,7 @@ async function dispatchTool(
   toolInput: Record<string, unknown>,
   offered: ReadonlySet<string>,
 ): Promise<{ ok: boolean; result: unknown; error?: string }> {
-  // Only a tool the request offered is dispatched, and its type is never the model's to choose (see tool-dispatch.ts).
-  if (!offered.has(toolName)) return { ok: false, result: null, error: `tool '${toolName}' was not offered in this request` };
-  const pointer = toolPointer(toolName, toolInput);
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 60_000);
-  try {
-    const target = await resolveToolEndpoint(toolName, endpoint);
-    const res = await fetch(target, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `ApiKey ${apiKey}`,
-      },
-      body: JSON.stringify({ impulse: { pointer } }),
-      signal: ctrl.signal,
-    });
-    clearTimeout(timer);
-    const text = await res.text();
-    if (!res.ok) return { ok: false, result: null, error: `HTTP ${res.status}: ${text.slice(0, 300)}` };
-    let parsed: unknown;
-    try { parsed = JSON.parse(text); } catch { parsed = text; }
-    if (parsed && typeof parsed === "object" && "body" in parsed) {
-      const env = parsed as Record<string, unknown>;
-      if (env.shape === "structuredError") return { ok: false, result: env.body, error: JSON.stringify(env.body).slice(0, 300) };
-      return { ok: true, result: env.body };
-    }
-    return { ok: true, result: parsed };
-  } catch (err) {
-    clearTimeout(timer);
-    return { ok: false, result: null, error: err instanceof Error ? err.message : String(err) };
-  }
+  return dispatchToolCall(resolveToolEndpoint, endpoint, apiKey, toolName, toolInput, offered);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -739,8 +675,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
   }
 
   // Tool-use loop (Anthropic)
-  const dispatchEndpoint = body.tool_dispatch_endpoint ?? DEFAULT_TOOL_DISPATCH_ENDPOINT;
-  const dispatchApiKey = body.tool_dispatch_api_key ?? process.env.METABOB_API_KEY ?? "";
+  const { endpoint: dispatchEndpoint, apiKey: dispatchApiKey } = toolDispatchRoute(body, DEFAULT_TOOL_DISPATCH_ENDPOINT, process.env.METABOB_API_KEY);
   const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
   const hasClientSideTools = body.tools.some((t) => !t.type || t.type === "custom");
   const offered = offeredToolNames(body.tools);
@@ -870,8 +805,7 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
   }
 
   // Tool-use loop (OpenAI format)
-  const dispatchEndpoint = body.tool_dispatch_endpoint ?? DEFAULT_TOOL_DISPATCH_ENDPOINT;
-  const dispatchApiKey = body.tool_dispatch_api_key ?? process.env.METABOB_API_KEY ?? "";
+  const { endpoint: dispatchEndpoint, apiKey: dispatchApiKey } = toolDispatchRoute(body, DEFAULT_TOOL_DISPATCH_ENDPOINT, process.env.METABOB_API_KEY);
   const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
   if (!dispatchApiKey) {
     return { resolved: false, shape: "llmCompletion", error: "tool-use requires METABOB_API_KEY" };

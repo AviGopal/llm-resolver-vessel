@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { offeredToolNames, toolPointer } from "./tool-dispatch";
+import { offeredToolNames, toolPointer, dispatchToolCall } from "./tool-dispatch";
 
 // The dispatcher, not the model, owns a tool call's routing (2026-09-30): the pointer was built as
 // { type: toolName, ...toolInput }, so a model-written "type" in the input replaced the tool it called — a
@@ -45,16 +45,28 @@ describe("only a tool the request offered is dispatchable", () => {
 describe("both tool-use loops dispatch through the guard", () => {
   const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
 
+  // The dispatch body moved to tool-dispatch.ts (dispatchToolCall); index.ts's dispatchTool delegates to it.
+  const dispatchSrc = readFileSync(join(import.meta.dir, "tool-dispatch.ts"), "utf8");
+
   test("the pointer is never built with the model's input spread over the tool type", () => {
     expect(src).not.toMatch(/\{\s*type:\s*toolName\s*,\s*\.\.\./);
-    expect(src).toContain("toolPointer(toolName, toolInput)");
+    // code only: tool-dispatch.ts's header comment quotes the old form
+    const dispatchCode = dispatchSrc.split("\n").filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join("\n");
+    expect(dispatchCode).not.toMatch(/\{\s*type:\s*toolName\s*,\s*\.\.\./);
+    expect(dispatchSrc).toContain("toolPointer(toolName, toolInput)");
+    expect(src).toContain("dispatchToolCall(resolveToolEndpoint,");
   });
 
-  test("dispatchTool refuses an unoffered tool before resolving its endpoint", () => {
-    const body = src.slice(src.indexOf("async function dispatchTool("));
+  test("dispatchTool refuses an unoffered tool before resolving its endpoint", async () => {
+    const body = dispatchSrc.slice(dispatchSrc.indexOf("export async function dispatchToolCall("));
     const refuse = body.indexOf("!offered.has(toolName)");
     expect(refuse).toBeGreaterThan(-1);
     expect(refuse).toBeLessThan(body.indexOf("resolveToolEndpoint("));
+    // and by behaviour: the endpoint lookup never runs for an unoffered tool
+    let looked = 0;
+    const r = await dispatchToolCall(async () => { looked++; return "http://x"; }, "http://x", "k", "shell", {}, new Set(["web_search"]));
+    expect(r.ok).toBe(false);
+    expect(looked).toBe(0);
   });
 
   test("the Anthropic and OpenAI loops each pass the request's offered set", () => {
