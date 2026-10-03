@@ -39,22 +39,47 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import ts from "typescript";
 import { isFailoverError } from "./provider-errors";
 
-const SRC = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
-const policyBlock = (): string => {
-  const i = SRC.indexOf("const llmCompletionWithPolicyHandler");
-  const j = SRC.indexOf("const runtime = new ExecutionRuntime", i);
-  expect(i).toBeGreaterThan(-1);
-  expect(j).toBeGreaterThan(i);
-  return SRC.slice(i, j);
+// ── CROSS-REPO CONTRACT FIXTURE ─────────────────────────────────────────────────────────────────
+// Vessels cannot import the super-repo's packages/; this block is copied verbatim from the emitter's
+// test so a super-repo check can compare the copies byte for byte.
+// CONTRACT-FIXTURE malformed_request BEGIN (emitter: development-vessel test/resolvers/llm-completion-dispatch-refuses-a-missing-prompt.test.ts)
+const MALFORMED_REQUEST = "malformed_request";
+// CONTRACT-FIXTURE malformed_request END
+
+// ── STRUCTURAL PINS READ THE SYNTAX TREE, NOT THE TEXT ──────────────────────────────────────────
+// Presence and order are judged on TypeScript AST positions of calls inside the named handler, so
+// whitespace, comments, local renames and line moves do not matter; only the calls and their order do.
+const INDEX_PATH = join(import.meta.dir, "index.ts");
+let _sf: ts.SourceFile | null = null;
+const indexSource = (): ts.SourceFile =>
+  (_sf ??= ts.createSourceFile(INDEX_PATH, readFileSync(INDEX_PATH, "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS));
+function walk(node: ts.Node, visit: (n: ts.Node) => void): void { visit(node); node.forEachChild((c) => walk(c, visit)); }
+/** The function bound to `name` (a const arrow/function expression, or a function declaration). */
+function fnNamed(name: string): ts.Node {
+  let found: ts.Node | undefined;
+  walk(indexSource(), (n) => {
+    if (found) return;
+    if (ts.isFunctionDeclaration(n) && n.name?.text === name) found = n;
+    else if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name && n.initializer
+      && (ts.isArrowFunction(n.initializer) || ts.isFunctionExpression(n.initializer))) found = n.initializer;
+  });
+  expect(found !== undefined, `index.ts must define '${name}'`).toBe(true);
+  return found!;
+}
+const calleeName = (c: ts.CallExpression): string => {
+  const e = c.expression;
+  return ts.isIdentifier(e) ? e.text : ts.isPropertyAccessExpression(e) ? e.name.text : "";
 };
-const handlerBlock = (): string => {
-  const i = SRC.indexOf("const llmCompletionHandler: ResolverHandler");
-  const j = SRC.indexOf("const llmCompletionWithPolicyHandler", i);
-  expect(i).toBeGreaterThan(-1);
-  return SRC.slice(i, j);
-};
+function callsTo(fn: ts.Node, callee: string): ts.CallExpression[] {
+  const out: ts.CallExpression[] = [];
+  walk(fn, (n) => { if (ts.isCallExpression(n) && calleeName(n) === callee) out.push(n); });
+  return out;
+}
+const firstAt = (fn: ts.Node, callee: string): number => callsTo(fn, callee)[0]?.getStart() ?? Number.POSITIVE_INFINITY;
+const identifiersIn = (n: ts.Node): Set<string> => { const s = new Set<string>(); walk(n, (m) => { if (ts.isIdentifier(m)) s.add(m.text); }); return s; };
 
 type Validation = null | { resolved: false; shape: string; error: string; failure_mode: string; field: string };
 async function seam(): Promise<{
@@ -76,7 +101,7 @@ describe("MUST-FAIL — the request validator is the caller-fault classifier", (
       const v = validateCompletionRequest({ type: "llm_completion", ...(prompt === undefined ? {} : { prompt }) });
       expect(v, `prompt=${JSON.stringify(prompt)}`).not.toBeNull();
       expect(v!.resolved).toBe(false);
-      expect(v!.failure_mode).toBe("malformed_request");
+      expect(v!.failure_mode).toBe(MALFORMED_REQUEST);
       expect(v!.field).toBe("prompt");
       expect(v!.error).toContain("body must include non-empty 'prompt' string");
     }
@@ -103,36 +128,39 @@ describe("MUST-FAIL — the request validator is the caller-fault classifier", (
 
 describe("MUST-FAIL — the policy handler validates before it draws an arm", () => {
   test("validateCompletionRequest runs before loadPolicy / selectArm / recordArmOutcome in llmCompletionWithPolicyHandler", () => {
-    const b = policyBlock();
-    const v = b.indexOf("validateCompletionRequest(");
-    expect(v, "the policy handler must validate the request").toBeGreaterThan(-1);
-    expect(v).toBeLessThan(b.indexOf("selectArm("));
-    expect(v).toBeLessThan(b.indexOf("loadPolicy("));
-    expect(v).toBeLessThan(b.indexOf("recordArmOutcome("));
+    const fn = fnNamed("llmCompletionWithPolicyHandler");
+    const v = firstAt(fn, "validateCompletionRequest");
+    expect(Number.isFinite(v), "the policy handler must validate the request").toBe(true);
+    for (const later of ["selectArm", "loadPolicy", "recordArmOutcome"]) {
+      expect(v < firstAt(fn, later), `validation must precede the first ${later}()`).toBe(true);
+    }
   });
 
   test("the malformed branch records malformed_request and returns before selection", () => {
-    const b = policyBlock();
-    const v = b.indexOf("validateCompletionRequest(");
-    const sel = b.indexOf("selectArm(");
-    const branch = v > -1 ? b.slice(v, sel) : "";
-    expect(branch.includes("recordMalformedRequest("), "the malformed branch must record the caller fault").toBe(true);
-    // The return must belong to the malformed branch itself (the pinned-model branch also returns).
-    const r = branch.indexOf("recordMalformedRequest(");
-    const blockEnd = r > -1 ? branch.indexOf("\n  }", r) : -1;
-    expect(r > -1 && blockEnd > r && /\breturn\s+\w+/.test(branch.slice(r, blockEnd)), "the malformed branch must return before an arm is drawn").toBe(true);
-    expect(branch.includes("recordArmOutcome("), "no arm outcome on a caller fault").toBe(false);
+    const fn = fnNamed("llmCompletionWithPolicyHandler");
+    const sel = firstAt(fn, "selectArm");
+    let ok = false;
+    walk(fn, (n) => {
+      if (ok || !ts.isIfStatement(n) || n.getStart() > sel) return;
+      const records = callsTo(n.thenStatement, "recordMalformedRequest").length > 0;
+      let returns = false;
+      walk(n.thenStatement, (m) => { if (ts.isReturnStatement(m)) returns = true; });
+      const grades = callsTo(n.thenStatement, "recordArmOutcome").length > 0;
+      ok = records && returns && !grades;
+    });
+    expect(ok, "an `if` before selectArm must record the caller fault and return, grading no arm").toBe(true);
   });
 
   test("llmCompletionHandler refuses with the same predicate (one refusal text, one classifier)", () => {
-    expect(handlerBlock().includes("validateCompletionRequest("), "llmCompletionHandler must use validateCompletionRequest").toBe(true);
+    expect(callsTo(fnNamed("llmCompletionHandler"), "validateCompletionRequest").length, "llmCompletionHandler must use validateCompletionRequest").toBeGreaterThan(0);
   });
 
   test("the caller-fault count is observable through the llmSpendSummary shape", () => {
-    const i = SRC.indexOf("const llmSpendSummaryHandler");
-    expect(i).toBeGreaterThan(-1);
-    const block = SRC.slice(i, SRC.indexOf("};", i));
-    expect(block.includes("malformed_requests"), "llmSpendSummary must carry malformed_requests").toBe(true);
+    let carried = false;
+    walk(fnNamed("llmSpendSummaryHandler"), (n) => {
+      if ((ts.isPropertyAssignment(n) || ts.isShorthandPropertyAssignment(n)) && (n.name as ts.Identifier).text === "malformed_requests") carried = true;
+    });
+    expect(carried, "llmSpendSummary must carry malformed_requests").toBe(true);
   });
 });
 
@@ -143,9 +171,20 @@ describe("CONTROL — a real model failure is still graded against the drawn arm
   });
 
   test("the record branch still grades a non-provider, non-budget failure with recordArmOutcome(sel.model, ...)", () => {
-    const b = policyBlock();
-    expect(/if \(!DRAFTING_TASK_TYPES\.has\([^)]*\)\)? && !providerLevelFailure && !budgetRefusal\)/.test(b)).toBe(true);
-    expect(b).toContain("await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true, body.task_type)");
+    // recordArmOutcome(<sel>.model, ...) under an `if` whose condition still excludes exactly the
+    // provider-level and budget refusals (and nothing named for a caller fault slips in as a blanket).
+    const fn = fnNamed("llmCompletionWithPolicyHandler");
+    let graded = false;
+    walk(fn, (n) => {
+      if (graded || !ts.isIfStatement(n)) return;
+      const cond = identifiersIn(n.expression);
+      if (!cond.has("providerLevelFailure") || !cond.has("budgetRefusal")) return;
+      graded = callsTo(n.thenStatement, "recordArmOutcome").some((c) => {
+        const a0 = c.arguments[0];
+        return !!a0 && ts.isPropertyAccessExpression(a0) && a0.name.text === "model";
+      });
+    });
+    expect(graded, "a non-provider, non-budget failure must still call recordArmOutcome(<selection>.model, ...)").toBe(true);
   });
 
   describe("recordArmOutcome(model, false) adds beta to exactly the drawn arm", () => {
