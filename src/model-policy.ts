@@ -15,6 +15,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { GateParams, StandingKind } from "./provider-standing.js";
 
 export interface PolicyArm {
   model: string;
@@ -40,6 +41,11 @@ export interface ModelPolicy {
   tool_result_max_chars?: number;
   /** Total tool-result characters one request's tool loop may add across all its turns. */
   tool_results_total_max_chars?: number;
+  /** How long a provider's standing (free cap, or N 402s) holds its arms out of draws, measured
+   * from the last observation or probe. See provider-standing.ts. */
+  provider_gate_window_ms?: number;
+  /** N: 402-class failures in one episode before a provider's paid arms are held out. */
+  provider_gate_credit_402s?: number;
 }
 
 /**
@@ -61,11 +67,50 @@ export interface ModelPolicy {
  * 16k chars is ~400 lines of source: enough to orient, after which the model is told to re-call
  * narrower. A single 525k-char result used to enter whole (~131k tokens, re-sent every turn).
  */
+/*
+ * provider_gate_window_ms = 2 h. Measured before the gate: a capped `:free` slug collected 4.0-4.7
+ * exhaust marks per model per hour (one per 10-minute cooldown expiry, each a wasted call and a
+ * failover hop). A 2 h window bounds that at one probe per window, i.e. at most one mark per model
+ * per 2 h, while a provider that recovers (the free cap resets daily; a balance gets topped up) is
+ * re-admitted within 2 h by the probe's own success.
+ */
 export const POLICY_DEFAULTS = {
   max_input_tokens_per_dispatch: 400_000,
   tool_result_max_chars: 16_000,
   tool_results_total_max_chars: 64_000,
+  provider_gate_window_ms: 7_200_000,
 } as const;
+
+/** N's default: two 402s, so a single 402 that a paid success clears never gates its provider.
+ * A small integer, so it cannot use effectivePolicyValue's >= 1000 rule; validated on its own. */
+export const PROVIDER_GATE_CREDIT_402S_DEFAULT = 2;
+
+export function effectiveGateParams(policy: Pick<ModelPolicy, "provider_gate_window_ms" | "provider_gate_credit_402s">): GateParams {
+  const n = policy.provider_gate_credit_402s;
+  return {
+    creditFailures: typeof n === "number" && Number.isInteger(n) && n >= 1 ? n : PROVIDER_GATE_CREDIT_402S_DEFAULT,
+    windowMs: effectivePolicyValue(policy, "provider_gate_window_ms"),
+  };
+}
+
+/** What selection reads from the provider standing (provider-standing.ts): the one tracker index.ts
+ * feeds and serves in llmQuotaState. Injected (setProviderStanding) rather than imported, because
+ * this module has no runtime relative imports: its tests load it under a cache-busting query
+ * (`./model-policy.js?t=<dir>`) whose path breaks relative resolution. Unset means no gate. */
+export interface StandingGate {
+  gateFor(model: string, nowMs: number, params: GateParams): StandingKind | null;
+  probeFor(model: string, nowMs: number, params: GateParams): StandingKind | null;
+  noteProbe(model: string, kind: StandingKind, nowMs: number): void;
+}
+let standing: StandingGate | null = null;
+export function setProviderStanding(s: StandingGate | null): void {
+  standing = s;
+}
+
+/** Gate parameters in force, read at use time (loadPolicy's 10 s cache). */
+export async function readGateParams(): Promise<GateParams> {
+  return effectiveGateParams(await loadPolicy());
+}
 
 /** The numeric policy fields that fall back to POLICY_DEFAULTS and are writable via llmModelPolicy_write. */
 export type DefaultedPolicyField = keyof typeof POLICY_DEFAULTS;
@@ -181,8 +226,21 @@ export async function selectArm(taskType?: string, availableModels?: string[]): 
   const maxCost = Math.max(...policy.arms.map((a) => a.cost_per_mtok ?? 0), 0.01);
   let best: { arm: PolicyArm; score: number } | null = null;
   const considered: Array<Record<string, unknown>> = [];
-  for (const arm of policy.arms) {
-    if (availableModels && !availableModels.includes(arm.model)) continue;
+  // ELIGIBILITY: an arm whose provider's standing holds (provider-standing.ts) gets no draw. If that
+  // would leave nothing to draw, the gate stands aside rather than empty the field: every provider
+  // is then out, and refusing here would only move the call onto the last-resort path.
+  const nowMs = Date.now();
+  const gate = effectiveGateParams(policy);
+  const candidates = policy.arms.filter((a) => !availableModels || availableModels.includes(a.model));
+  const gated: Array<{ model: string; reason: StandingKind }> = [];
+  for (const a of candidates) {
+    const reason = standing?.gateFor(a.model, nowMs, gate) ?? null;
+    if (reason) gated.push({ model: a.model, reason });
+  }
+  const gateBypassed = gated.length > 0 && gated.length === candidates.length;
+  const heldOut = new Set(gateBypassed ? [] : gated.map((g) => g.model));
+  for (const arm of candidates) {
+    if (heldOut.has(arm.model)) continue;
     const hasTask = !!(taskType && arm.task_alpha && arm.task_alpha[taskType] !== undefined);
     const taskAlpha = hasTask ? arm.task_alpha![taskType]! : (taskType ? 1 : arm.alpha);
     const taskBeta = hasTask ? arm.task_beta![taskType]! : (taskType ? 1 : arm.beta);
@@ -193,6 +251,10 @@ export async function selectArm(taskType?: string, availableModels?: string[]): 
     if (!best || score > best.score) best = { arm, score };
   }
   if (!best) return null;
+  // The bounded re-admission probe: drawing a held provider's arm after its window lapsed re-arms
+  // the window, so concurrent draws stay out until this one answers.
+  const probe = standing?.probeFor(best.arm.model, nowMs, gate) ?? null;
+  if (probe) standing!.noteProbe(best.arm.model, probe, nowMs);
   return {
     model: best.arm.model,
     meta: {
@@ -200,6 +262,8 @@ export async function selectArm(taskType?: string, availableModels?: string[]): 
       selected: best.arm.model,
       sampled_score: Number(best.score.toFixed(4)),
       considered,
+      ...(gated.length > 0 ? { gated, ...(gateBypassed ? { gate_bypassed: true } : {}) } : {}),
+      ...(probe ? { probe } : {}),
     },
   };
 }
@@ -367,7 +431,10 @@ export async function recordArmOutcomeFromPending(executionId: string, reached: 
 }
 
 function effectiveDefaultedValues(policy: ModelPolicy): Record<string, number> {
-  return Object.fromEntries(DEFAULTED_FIELDS.map((f) => [f, effectivePolicyValue(policy, f)]));
+  return {
+    ...Object.fromEntries(DEFAULTED_FIELDS.map((f) => [f, effectivePolicyValue(policy, f)])),
+    provider_gate_credit_402s: effectiveGateParams(policy).creditFailures,
+  };
 }
 
 export async function llmModelPolicyHandler(): Promise<{ resolved: boolean; shape: string; body: ModelPolicy & { effective: Record<string, number> } }> {
@@ -377,10 +444,17 @@ export async function llmModelPolicyHandler(): Promise<{ resolved: boolean; shap
 }
 
 export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body?: unknown; error?: string }> {
-  const req = ctx.body as { arms?: PolicyArm[]; cost_weight?: number; merge?: boolean } & Partial<Record<DefaultedPolicyField, number | null>>;
+  const req = ctx.body as { arms?: PolicyArm[]; cost_weight?: number; merge?: boolean; provider_gate_credit_402s?: number | null } & Partial<Record<DefaultedPolicyField, number | null>>;
   const fields = req != null && typeof req === "object" ? DEFAULTED_FIELDS.filter((f) => f in req) : [];
-  if (!req || (!Array.isArray(req.arms) && typeof req.cost_weight !== "number" && fields.length === 0)) {
-    return { resolved: false, shape: "llmModelPolicyWriteResult", error: `body must include arms[], cost_weight and/or one of ${DEFAULTED_FIELDS.join(", ")}` };
+  const hasGateN = req != null && typeof req === "object" && "provider_gate_credit_402s" in req;
+  if (!req || (!Array.isArray(req.arms) && typeof req.cost_weight !== "number" && fields.length === 0 && !hasGateN)) {
+    return { resolved: false, shape: "llmModelPolicyWriteResult", error: `body must include arms[], cost_weight and/or one of ${[...DEFAULTED_FIELDS, "provider_gate_credit_402s"].join(", ")}` };
+  }
+  if (hasGateN) {
+    const n = req.provider_gate_credit_402s;
+    if (n !== null && !(typeof n === "number" && Number.isInteger(n) && n >= 1)) {
+      return { resolved: false, shape: "llmModelPolicyWriteResult", error: "provider_gate_credit_402s must be an integer >= 1, or null to use the default" };
+    }
   }
   for (const f of fields) {
     const v = req[f];
@@ -390,6 +464,10 @@ export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promis
   }
   const policy = await loadPolicy();
   if (typeof req.cost_weight === "number") policy.cost_weight = req.cost_weight;
+  if (hasGateN) {
+    if (req.provider_gate_credit_402s === null || req.provider_gate_credit_402s === undefined) delete policy.provider_gate_credit_402s;
+    else policy.provider_gate_credit_402s = req.provider_gate_credit_402s;
+  }
   for (const f of fields) {
     const v = req[f];
     if (v === null || v === undefined) delete policy[f];

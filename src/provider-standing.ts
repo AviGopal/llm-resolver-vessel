@@ -23,6 +23,16 @@
  *    clears free_cap. fallback_model names the model that last served in place of one of the
  *    provider's models, and clears when the provider is back in standing.
  *
+ * ELIGIBILITY (gateFor / admit). The per-model cooldown already keeps a failed arm out for one
+ * cooldown window; what it cannot do is keep a provider out ACROSS window expiries. A capped
+ * `:free` slug came back every 10 minutes and 429'd again, 4-5 exhaust marks per model per hour.
+ * While a provider's standing holds (free cap, or N 402s, within the shaped window), its affected
+ * arms get no draws from selection or the fallback walk; once the window lapses ONE draw is let
+ * through as a probe and re-arms the window, so a still-capped provider is re-tried at most once
+ * per window, and a recovered one is cleared by the probe's success. N and the window are read at
+ * use time from the shaped llmModelPolicy (model-policy.ts), never constants here. Gating draws
+ * nothing and grades nothing, so the arms' quality alpha/beta are untouched while held out.
+ *
  * Extracted from index.ts so it can be tested directly (index.ts starts a server at import time),
  * following last-resort, plane-outage and scale-to-zero.
  */
@@ -56,6 +66,12 @@ export const STANDING_FIELDS = [
   "free_cap", "free_cap_since", "fallback_model", "cooling_models",
 ] as const;
 
+/** Shaped gate parameters (llmModelPolicy provider_gate_credit_402s / provider_gate_window_ms). */
+export interface GateParams {
+  creditFailures: number;
+  windowMs: number;
+}
+
 export interface StandingEntry {
   credit: "ok" | "exhausted";
   /** First 402 of the episode, while credit is exhausted; else null. */
@@ -78,6 +94,10 @@ interface Row {
   freeCapSince: number | null;
   lastFreeCapAt: number | null;
   fallbackModel: string | null;
+  /** A 402 came from a `:free` slug in this episode (a negative balance stops the free tier too). */
+  free402: boolean;
+  creditProbeAt: number | null;
+  freeCapProbeAt: number | null;
 }
 
 const iso = (ms: number | null): string | null => (ms === null ? null : new Date(ms).toISOString());
@@ -102,7 +122,10 @@ export class ProviderStandingTracker {
   private row(provider: string): Row {
     let r = this.rows.get(provider);
     if (!r) {
-      r = { credit402s: 0, first402At: null, last402At: null, freeCapSince: null, lastFreeCapAt: null, fallbackModel: null };
+      r = {
+        credit402s: 0, first402At: null, last402At: null, freeCapSince: null, lastFreeCapAt: null, fallbackModel: null,
+        free402: false, creditProbeAt: null, freeCapProbeAt: null,
+      };
       this.rows.set(provider, r);
     }
     return r;
@@ -111,15 +134,16 @@ export class ProviderStandingTracker {
   /** A provider call for `model` failed with `error`. Returns the class recorded, if any. */
   recordFailure(provider: string, model: string, error: unknown, nowMs: number): StandingKind | null {
     const kind = classifyStandingError(model, error);
-    if (kind) this.recordKind(provider, kind, nowMs);
+    if (kind) this.recordKind(provider, kind, nowMs, model);
     return kind;
   }
 
   /** Record a failure whose class the caller already knows (e.g. the anthropic credit-dead path). */
-  recordKind(provider: string, kind: StandingKind, nowMs: number): void {
+  recordKind(provider: string, kind: StandingKind, nowMs: number, model?: string): void {
     const r = this.row(provider);
     if (kind === "credit") {
       r.credit402s += 1;
+      if (model !== undefined && isFreeSlug(model)) r.free402 = true;
       if (r.first402At === null) r.first402At = nowMs;
       r.last402At = nowMs;
     } else {
@@ -135,11 +159,14 @@ export class ProviderStandingTracker {
     if (isFreeSlug(model)) {
       r.freeCapSince = null;
       r.lastFreeCapAt = null;
+      r.freeCapProbeAt = null;
     } else {
       r.credit402s = 0;
       r.first402At = null;
       r.last402At = null;
+      r.creditProbeAt = null;
     }
+    r.free402 = false; // whichever tier answered, the account is not in negative balance
     if (r.credit402s === 0 && r.freeCapSince === null) r.fallbackModel = null;
   }
 
@@ -149,6 +176,52 @@ export class ProviderStandingTracker {
     if (!provider || fromModel === servedModel) return;
     const r = this.row(provider);
     if (r.credit402s > 0 || r.freeCapSince !== null) r.fallbackModel = servedModel;
+  }
+
+  /** The standing that applies to `model`, whether or not its window is still running. A paid 402
+   * holds the provider's paid arms; the free cap holds its `:free` arms; a 402 from a `:free` slug
+   * holds both. Returns the last observation (or probe) time that the window runs from. */
+  private standingOf(model: string, params: GateParams): { kind: StandingKind; at: number } | null {
+    const provider = this.providerOf(model);
+    const r = provider ? this.rows.get(provider) : undefined;
+    if (!r) return null;
+    const free = isFreeSlug(model);
+    if (free && r.lastFreeCapAt !== null) return { kind: "free_cap", at: Math.max(r.lastFreeCapAt, r.freeCapProbeAt ?? 0) };
+    if ((!free || r.free402) && r.credit402s >= params.creditFailures && r.last402At !== null) {
+      return { kind: "credit", at: Math.max(r.last402At, r.creditProbeAt ?? 0) };
+    }
+    return null;
+  }
+
+  /** Why `model` gets no draw right now (its provider's standing, inside the window), else null. */
+  gateFor(model: string, nowMs: number, params: GateParams): StandingKind | null {
+    const s = this.standingOf(model, params);
+    return s && nowMs - s.at < params.windowMs ? s.kind : null;
+  }
+
+  /** A draw of `model` now would be the re-admission probe: standing held, window lapsed. */
+  probeFor(model: string, nowMs: number, params: GateParams): StandingKind | null {
+    const s = this.standingOf(model, params);
+    return s && nowMs - s.at >= params.windowMs ? s.kind : null;
+  }
+
+  /** `model` is being drawn as the probe: re-arm the window so concurrent draws stay held out
+   * until the probe answers (a success clears the standing; a failure records it again). */
+  noteProbe(model: string, kind: StandingKind, nowMs: number): void {
+    const provider = this.providerOf(model);
+    const r = provider ? this.rows.get(provider) : undefined;
+    if (!r) return;
+    if (kind === "free_cap") r.freeCapProbeAt = nowMs;
+    else r.creditProbeAt = nowMs;
+  }
+
+  /** For a caller that tries `model` immediately (the fallback walk): false while held out; true
+   * otherwise, noting the probe when this try is one. */
+  admit(model: string, nowMs: number, params: GateParams): boolean {
+    if (this.gateFor(model, nowMs, params)) return false;
+    const probe = this.probeFor(model, nowMs, params);
+    if (probe) this.noteProbe(model, probe, nowMs);
+    return true;
   }
 
   /** The standing fields for `provider`, exactly STANDING_FIELDS. */

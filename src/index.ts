@@ -41,7 +41,7 @@ import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall, type ToolDispatchRoute } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
-import { selectArm, recordArmOutcome, servedArmOf, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
+import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { ToolResultBudget } from "./tool-result-bound.js";
 import { decideLastResort } from "./last-resort.js";
@@ -437,6 +437,8 @@ for (const p of OPENAI_WIRE_PROVIDERS) {
   if (p.id === "openrouter") openrouterClient = client;
   console.log(`[llm-resolver-vessel] OpenAI-wire provider '${p.id}': ${p.baseURL} (${p.models.length} models)`);
 }
+// Selection reads the same standing llmQuotaState serves (the eligibility gate, model-policy.ts).
+setProviderStanding(providerStanding);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider routing
@@ -1193,8 +1195,12 @@ const walkFallbackModels = async (
   fromModel: string,
 ): Promise<Record<string, unknown> | null> => {
   const tried = new Set<string>([fromModel]);
+  const gate = await readGateParams();
   for (const [fbModel, client] of modelClientMap) {
     if (tried.has(fbModel) || inModelCooldown(fbModel)) continue;
+    // A provider held out by its standing (free cap, or N 402s, in the shaped window) is not
+    // re-tried on every cooldown expiry: at most one probe per window (provider-standing.ts).
+    if (!providerStanding.admit(fbModel, Date.now(), gate)) continue;
     tried.add(fbModel);
     console.warn(`[llm-resolver-vessel] provider exhausted for '${fromModel}' — falling back to '${fbModel}'`);
     const fb = await resolveWithOpenAI({ ...body, model: fbModel }, client);
