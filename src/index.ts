@@ -41,7 +41,7 @@ import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall, type ToolDispatchRoute } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
-import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
+import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { ToolResultBudget } from "./tool-result-bound.js";
 import { decideLastResort } from "./last-resort.js";
@@ -186,8 +186,9 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
     models: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-flash-preview"] },
   // LAST in the registry on purpose: the exhaustion failover walk reads this
-  // order, and scale-to-zero capacity is the one lane that must never be
-  // reached ahead of an always-on provider.
+  // order (after any shaped llmModelPolicy.fallback_order), and scale-to-zero
+  // capacity is the one lane that must never be reached ahead of an always-on
+  // provider.
   ...(RUNPOD_ENDPOINT_ID ? [{
     id: "runpod-serverless",
     baseURL: `https://api.runpod.ai/v2/${RUNPOD_ENDPOINT_ID}/openai/v1`,
@@ -1189,15 +1190,18 @@ const markModelExhausted = (m: string, ms: number = EXHAUSTION_COOLDOWN_MS): voi
 };
 
 // Shared billing-exhaustion fallback: walk every keyed wire model not in its
-// own cooldown, in registry order (paid tiers first, :free last resort).
+// own cooldown, in the shaped llmModelPolicy.fallback_order, then registry
+// order (paid tiers first, :free last resort) for the rest.
 const walkFallbackModels = async (
   body: LlmCompletionRequest,
   fromModel: string,
 ): Promise<Record<string, unknown> | null> => {
   const tried = new Set<string>([fromModel]);
   const gate = await readGateParams();
-  for (const [fbModel, client] of modelClientMap) {
-    if (tried.has(fbModel) || inModelCooldown(fbModel)) continue;
+  const order = fallbackWalkOrder([...modelClientMap.keys()], await readFallbackOrder());
+  for (const fbModel of order) {
+    const client = modelClientMap.get(fbModel);
+    if (!client || tried.has(fbModel) || inModelCooldown(fbModel)) continue;
     // A provider held out by its standing (free cap, or N 402s, in the shaped window) is not
     // re-tried on every cooldown expiry: at most one probe per window (provider-standing.ts).
     if (!providerStanding.admit(fbModel, Date.now(), gate)) continue;

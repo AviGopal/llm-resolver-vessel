@@ -46,6 +46,9 @@ export interface ModelPolicy {
   provider_gate_window_ms?: number;
   /** N: 402-class failures in one episode before a provider's paid arms are held out. */
   provider_gate_credit_402s?: number;
+  /** The order the exhaustion fallback walk tries models in: these first, in this order, then
+   * every other routable model in registry order. Unset means registry order. */
+  fallback_order?: string[];
 }
 
 /**
@@ -91,6 +94,26 @@ export function effectiveGateParams(policy: Pick<ModelPolicy, "provider_gate_win
     creditFailures: typeof n === "number" && Number.isInteger(n) && n >= 1 ? n : PROVIDER_GATE_CREDIT_402S_DEFAULT,
     windowMs: effectivePolicyValue(policy, "provider_gate_window_ms"),
   };
+}
+
+/** The fallback walk's order: `preferred` (the shaped llmModelPolicy.fallback_order) first, keeping
+ * only routable, distinct ids, then the rest of `routable` in its registry order. Before this the
+ * walk order WAS the registry order, a code constant ("paid first, :free last"), so preferring a
+ * funded paid slug meant editing index.ts. A preference can only reorder: it never adds a model
+ * the registry cannot route and never drops one it can. */
+export function fallbackWalkOrder(routable: readonly string[], preferred: unknown): string[] {
+  const known = new Set(routable);
+  const head: string[] = [];
+  if (Array.isArray(preferred)) {
+    for (const m of preferred) if (typeof m === "string" && known.has(m) && !head.includes(m)) head.push(m);
+  }
+  const inHead = new Set(head);
+  return [...head, ...routable.filter((m) => !inHead.has(m))];
+}
+
+/** The shaped fallback order in force, read at use time (loadPolicy's 10 s cache). */
+export async function readFallbackOrder(): Promise<string[] | undefined> {
+  return (await loadPolicy()).fallback_order;
 }
 
 /** What selection reads from the provider standing (provider-standing.ts): the one tracker index.ts
@@ -444,11 +467,18 @@ export async function llmModelPolicyHandler(): Promise<{ resolved: boolean; shap
 }
 
 export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body?: unknown; error?: string }> {
-  const req = ctx.body as { arms?: PolicyArm[]; cost_weight?: number; merge?: boolean; provider_gate_credit_402s?: number | null } & Partial<Record<DefaultedPolicyField, number | null>>;
+  const req = ctx.body as { arms?: PolicyArm[]; cost_weight?: number; merge?: boolean; provider_gate_credit_402s?: number | null; fallback_order?: string[] | null } & Partial<Record<DefaultedPolicyField, number | null>>;
   const fields = req != null && typeof req === "object" ? DEFAULTED_FIELDS.filter((f) => f in req) : [];
   const hasGateN = req != null && typeof req === "object" && "provider_gate_credit_402s" in req;
-  if (!req || (!Array.isArray(req.arms) && typeof req.cost_weight !== "number" && fields.length === 0 && !hasGateN)) {
-    return { resolved: false, shape: "llmModelPolicyWriteResult", error: `body must include arms[], cost_weight and/or one of ${[...DEFAULTED_FIELDS, "provider_gate_credit_402s"].join(", ")}` };
+  const hasOrder = req != null && typeof req === "object" && "fallback_order" in req;
+  if (!req || (!Array.isArray(req.arms) && typeof req.cost_weight !== "number" && fields.length === 0 && !hasGateN && !hasOrder)) {
+    return { resolved: false, shape: "llmModelPolicyWriteResult", error: `body must include arms[], cost_weight and/or one of ${[...DEFAULTED_FIELDS, "provider_gate_credit_402s", "fallback_order"].join(", ")}` };
+  }
+  if (hasOrder) {
+    const o = req.fallback_order;
+    if (o !== null && !(Array.isArray(o) && o.every((m) => typeof m === "string" && m.length > 0))) {
+      return { resolved: false, shape: "llmModelPolicyWriteResult", error: "fallback_order must be an array of model ids, or null to use registry order" };
+    }
   }
   if (hasGateN) {
     const n = req.provider_gate_credit_402s;
@@ -467,6 +497,10 @@ export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promis
   if (hasGateN) {
     if (req.provider_gate_credit_402s === null || req.provider_gate_credit_402s === undefined) delete policy.provider_gate_credit_402s;
     else policy.provider_gate_credit_402s = req.provider_gate_credit_402s;
+  }
+  if (hasOrder) {
+    if (req.fallback_order === null || req.fallback_order === undefined) delete policy.fallback_order;
+    else policy.fallback_order = [...req.fallback_order];
   }
   for (const f of fields) {
     const v = req[f];
