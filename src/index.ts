@@ -45,6 +45,7 @@ import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmMode
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { ToolResultBudget } from "./tool-result-bound.js";
 import { decideLastResort } from "./last-resort.js";
+import { providerStanding, type StandingEntry } from "./provider-standing.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -396,18 +397,26 @@ async function reportPlaneState(): Promise<void> {
 }
 
 async function llmQuotaStateHandler(_ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body: unknown }> {
-  const providers: Record<string, { present: boolean; cooldown_until_ms: number | null }> = {};
+  // Each entry also carries the provider's credit / free-cap standing (provider-standing.ts):
+  // additive fields, status enums, timestamps, counts and model ids only. The provider-level
+  // cooldown below is set only on the anthropic/openai primary path, so a wire provider whose
+  // every model 402s showed cooldown_until_ms null here and nothing else; the standing is what
+  // says it is out of credit, and which model is serving instead.
+  const providers: Record<string, { present: boolean; cooldown_until_ms: number | null } & StandingEntry> = {};
   for (const p of OPENAI_WIRE_PROVIDERS) {
     const until = exhaustedUntil.get(p.baseURL) ?? null;
     providers[p.id] = {
       present: modelClientMap.has(p.models[0] ?? ""),
       cooldown_until_ms: until && until > Date.now() ? until : null,
+      ...providerStanding.entry(p.id, EXHAUSTION_COOLDOWN_MS, p.models.filter(inModelCooldown)),
     };
   }
   const anthropicUntil = exhaustedUntil.get("anthropic") ?? null;
   providers["anthropic"] = {
     present: anthropic !== null,
     cooldown_until_ms: anthropicUntil && anthropicUntil > Date.now() ? anthropicUntil : null,
+    ...providerStanding.entry("anthropic", EXHAUSTION_COOLDOWN_MS,
+      [...modelExhaustedUntil.keys()].filter((m) => providerStanding.providerOf(m) === "anthropic" && inModelCooldown(m))),
   };
   return { resolved: true, shape: "llmQuotaState", body: { providers } };
 }
@@ -424,6 +433,7 @@ for (const p of OPENAI_WIRE_PROVIDERS) {
   }
   const client = new OpenAI({ apiKey: key, baseURL: p.baseURL });
   for (const m of p.models) modelClientMap.set(m, client);
+  providerStanding.registerModels(p.id, p.models);
   if (p.id === "openrouter") openrouterClient = client;
   console.log(`[llm-resolver-vessel] OpenAI-wire provider '${p.id}': ${p.baseURL} (${p.models.length} models)`);
 }
@@ -618,7 +628,7 @@ function slideCacheBreakpoint(messages: Array<{ role: string; content: unknown }
   }
 }
 
-async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<string, unknown>> {
+async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promise<Record<string, unknown>> {
   if (!anthropic) {
     return { resolved: false, shape: "llmCompletion", error: "ANTHROPIC_API_KEY not configured" };
   }
@@ -758,7 +768,7 @@ async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<
 // OpenAI-compatible resolution path (OpenAI, Ollama, Groq, Together, vLLM, …)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | null = openaiClient): Promise<Record<string, unknown>> {
+async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: OpenAI | null = openaiClient): Promise<Record<string, unknown>> {
   if (!client) {
     return { resolved: false, shape: "llmCompletion", error: "OPENAI_API_KEY not configured" };
   }
@@ -895,6 +905,41 @@ async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | nu
     iterations: toolCalls.length > 0 ? toolCalls[toolCalls.length - 1]!.iteration : 0,
     usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens },
   };
+}
+
+// Every provider call goes through one of these two, so the provider standing that llmQuotaState
+// serves is fed at one place per wire instead of at each failover site. The model id recorded is
+// the one the caller asked for (the arm id), not the prefix-stripped id the wire path returns.
+function wireProviderIdOf(client: OpenAI | null): string {
+  if (client === null || client === openaiClient) return "openai";
+  const key = providerKeyOf(client);
+  return OPENAI_WIRE_PROVIDERS.find((p) => p.baseURL === key)?.id ?? key;
+}
+
+async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | null = openaiClient): Promise<Record<string, unknown>> {
+  const r = await resolveWithOpenAIUnobserved(body, client);
+  const model = body.model ?? DEFAULT_MODEL;
+  if (r.resolved === true) providerStanding.recordServed(wireProviderIdOf(client), model);
+  else providerStanding.recordFailure(wireProviderIdOf(client), model, r.error, Date.now());
+  return r;
+}
+
+async function resolveWithAnthropic(body: LlmCompletionRequest): Promise<Record<string, unknown>> {
+  const r = await resolveWithAnthropicUnobserved(body);
+  const model = body.model ?? DEFAULT_MODEL;
+  if (r.fallback_from === "anthropic-credit" && typeof r.model === "string") {
+    // anthropicCreditFallback fires only on a credit-dead anthropic answer, and served the call
+    // on a wire model: anthropic is out of credit, the wire model served in its place.
+    providerStanding.recordKind("anthropic", "credit", Date.now());
+    const servedBy = providerStanding.providerOf(r.model);
+    if (servedBy) providerStanding.recordServed(servedBy, r.model);
+    providerStanding.recordFallback(model, r.model);
+  } else if (r.resolved === true) {
+    providerStanding.recordServed("anthropic", model);
+  } else {
+    providerStanding.recordFailure("anthropic", model, r.error, Date.now());
+  }
+  return r;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1155,6 +1200,7 @@ const walkFallbackModels = async (
     const fb = await resolveWithOpenAI({ ...body, model: fbModel }, client);
     if (fb.resolved === true) {
       clearExhausted(providerKeyOf(client));
+      providerStanding.recordFallback(fromModel, fbModel);
       return { ...fb, fallback_from: fromModel };
     }
     if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
