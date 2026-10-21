@@ -257,8 +257,12 @@ export function gateLogLine(
   const bypassed = meta.gate_bypassed === true;
   const served = typeof result.fallback_from === "string" && typeof result.served_model === "string" ? result.served_model : null;
   if (!gated && !probe && !bypassed && served === null) return null;
-  return `[llm-gate] provider=${provider ?? "unknown"} model=${model} gated=${gated} probe=${probe} gate_bypassed=${bypassed} served_model=${served ?? "-"}`;
+  return `[llm-gate] provider=${bare(provider ?? "unknown")} model=${bare(model)} gated=${gated} probe=${probe} gate_bypassed=${bypassed} served_model=${served === null ? "-" : bare(served)}`;
 }
+
+/** Every value in the line is one bare token, so a `key=(\S+)` reader parses it: whitespace and
+ * quotes become "_" (policy arm ids are writable strings), and an empty id reads "-". */
+const bare = (id: string): string => id.replace(/[\s"'`]/g, "_") || "-";
 
 /** The vessel's one tracker, shared by index.ts (which feeds and serves it) and the selector. */
 export const providerStanding = new ProviderStandingTracker();

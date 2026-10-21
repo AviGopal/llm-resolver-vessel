@@ -76,6 +76,30 @@ describe("MUST-FAIL: a gated selection logs exactly one [llm-gate] line", () => 
   });
 });
 
+describe("MUST-FAIL: every value is a bare token, in the parser's field order", () => {
+  // The by-effect reader's pattern, verbatim.
+  const PARSER = /provider=(\S+) model=(\S+) gated=(true|false) probe=(true|false) gate_bypassed=(true|false) served_model=(\S+)/;
+  test("ids with spaces or quotes are sanitised to single tokens; an empty id reads -", () => {
+    const gateLogLine = seam();
+    const line = gateLogLine('my "router"', "odd model 'x'\tv2", {}, { resolved: true, fallback_from: "a", served_model: "b `c` d" })!;
+    expect(line).toBe("[llm-gate] provider=my__router_ model=odd_model__x__v2 gated=false probe=false gate_bypassed=false served_model=b__c__d");
+    const m = PARSER.exec(line)!;
+    expect(m).not.toBeNull();
+    expect(m.slice(1)).toEqual(["my__router_", "odd_model__x__v2", "false", "false", "false", "b__c__d"]);
+    expect(line).toMatch(LINE);
+    expect(gateLogLine(null, "", { probe: "credit" }, {})).toBe(
+      "[llm-gate] provider=unknown model=- gated=false probe=true gate_bypassed=false served_model=-");
+  });
+
+  test("a real :free model id passes through unchanged and parses", () => {
+    const gateLogLine = seam();
+    const line = gateLogLine("openrouter", "nvidia/nemotron-3-nano-30b-a3b:free", {}, {
+      resolved: true, fallback_from: "nvidia/nemotron-3-nano-30b-a3b:free", served_model: "google/gemini-2.5-flash" })!;
+    expect(line).toBe("[llm-gate] provider=openrouter model=nvidia/nemotron-3-nano-30b-a3b:free gated=false probe=false gate_bypassed=false served_model=google/gemini-2.5-flash");
+    expect(PARSER.exec(line)!.slice(1)).toEqual(["openrouter", "nvidia/nemotron-3-nano-30b-a3b:free", "false", "false", "false", "google/gemini-2.5-flash"]);
+  });
+});
+
 describe("CONTROL: an ungated, non-rescue selection logs nothing", () => {
   test("a real ungated selection gives no line", async () => {
     const gateLogLine = seam();
