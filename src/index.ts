@@ -151,8 +151,6 @@ const RUNPOD_COST_PER_MTOK = ((): number => {
 // construct an OpenAI client, which requires a non-empty apiKey string.
 interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; models: string[]; defaultKey?: string; }
 const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
-  { id: "chutes", baseURL: "https://llm.chutes.ai/v1", apiKeyEnv: "CHUTES_API_KEY",
-    models: ["zai-org/GLM-5.1-TEE", "zai-org/GLM-5.2-TEE", "moonshotai/Kimi-K2.6-TEE", "deepseek-ai/DeepSeek-V3.2-TEE"] },
   // FUNDED quota providers (groq + mistral) placed HIGH so the exhaustion
   // failover walk reaches them before the rate-limited openrouter-free / gemini
   // lanes — under load the fleet was burning all four gemini models (each 45s
