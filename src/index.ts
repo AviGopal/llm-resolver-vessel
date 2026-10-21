@@ -41,7 +41,7 @@ import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall, type ToolDispatchRoute } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
-import { selectArm, recordArmOutcome, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
+import { selectArm, recordArmOutcome, servedArmOf, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { ToolResultBudget } from "./tool-result-bound.js";
 import { decideLastResort } from "./last-resort.js";
@@ -574,7 +574,7 @@ async function anthropicCreditFallback(
     return {
       resolved: true, shape: "llmCompletion", content,
       provider: "openai-wire", model: fallbackModel,
-      fallback_from: "anthropic-credit",
+      fallback_from: "anthropic-credit", served_model: fallbackModel,
       usage: {
         input_tokens: completion.usage?.prompt_tokens ?? 0,
         output_tokens: completion.usage?.completion_tokens ?? 0,
@@ -1201,7 +1201,9 @@ const walkFallbackModels = async (
     if (fb.resolved === true) {
       clearExhausted(providerKeyOf(client));
       providerStanding.recordFallback(fromModel, fbModel);
-      return { ...fb, fallback_from: fromModel };
+      // served_model is the arm id (fb.model is the wire id, "openai/" stripped): the response
+      // says which model served, and the policy grade credits it instead of fromModel.
+      return { ...fb, fallback_from: fromModel, served_model: fbModel };
     }
     if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
     if (fb.dispatch_budget_exhausted === true) return fb; // the dispatch's allowance is spent for every model too
@@ -1420,12 +1422,23 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
     const providerLevelFailure = armFailed && isFailoverError((result as { error?: unknown }).error);
     // A dispatch-budget refusal says the DISPATCH spent its allowance, not that the model answered badly.
     const budgetRefusal = (result as { dispatch_budget_exhausted?: unknown }).dispatch_budget_exhausted === true;
-    if (!DRAFTING_TASK_TYPES.has(body.task_type ?? "") && !providerLevelFailure && !budgetRefusal) {
-      await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true, body.task_type);
+    // CREDIT THE ARM THAT SERVED. A fallback rescue returns resolved:true for a call sel.model
+    // failed; grading sel.model on it gave the failed arm alpha (servedArmOf, model-policy.ts).
+    const servedModel = servedArmOf(sel.model, result as Record<string, unknown>);
+    if (!DRAFTING_TASK_TYPES.has(body.task_type ?? "") && !providerLevelFailure && !budgetRefusal && servedModel !== null) {
+      if (servedModel === sel.model) {
+        // The drawn arm answered: grade it on its own answer.
+        await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true, body.task_type);
+      } else {
+        // A fallback answered in its place: credit the server; the drawn arm is left unchanged.
+        await recordArmOutcome(servedModel, (result as { resolved?: boolean }).resolved === true, body.task_type);
+      }
     } else if (providerLevelFailure) {
       console.log(
         `[llm-resolver-vessel] NOT grading ${sel.model} — provider-level failure (billing/unreachable), not a quality outcome`,
       );
+    } else if (servedModel === null) {
+      console.log(`[llm-resolver-vessel] NOT grading ${sel.model} — a fallback served it and did not name the model`);
     }
   } catch (err) {
     console.warn("[llm-resolver-vessel] policy outcome record failed (non-fatal):", err);

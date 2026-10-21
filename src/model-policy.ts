@@ -231,6 +231,24 @@ export async function recordArmOutcome(model: string, ok: boolean, taskType?: st
   await savePolicy(policy);
 }
 
+/** The arm a policy-selected completion is graded against: the arm that SERVED it.
+ *
+ * A completion the selected arm could not serve (a 402, a free-cap 429, a timeout) and a fallback
+ * rescued comes back `resolved: true` with `fallback_from` set. Grading `selected` on that result
+ * credited alpha to the arm that FAILED; measured on a node, 43 failing calls in three hours, all
+ * rescued (42 by one paid model), and the alpha went to the capped `:free` arms that had failed.
+ * Those arms are never charged beta for the infra failure either (index.ts declines to grade
+ * provider-level failures), so the borrowed alpha was the only evidence they ever got, and the
+ * selector kept drawing them first.
+ *
+ * So a fallback-served result is graded against `served_model` (the arm id the fallback reports)
+ * and never against `selected`. A fallback result that does not name what served it returns null:
+ * grade nothing rather than guess. */
+export function servedArmOf(selected: string, result: Record<string, unknown>): string | null {
+  if (typeof result.fallback_from !== "string") return selected;
+  return typeof result.served_model === "string" && result.served_model.length > 0 ? result.served_model : null;
+}
+
 /** Idempotently ensure a policy arm exists for each model (used to register
  * self-hosted vLLM models discovered from env at startup, so the Thompson
  * selector can pick them in auto mode). Existing arms are left untouched — their
