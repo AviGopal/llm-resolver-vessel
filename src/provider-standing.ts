@@ -242,5 +242,23 @@ export class ProviderStandingTracker {
   }
 }
 
+/** The journal line for one gate-relevant policy selection, or null when there is nothing to say.
+ *
+ * model_selection.meta (gated / probe / gate_bypassed) and served_model ride on the completion
+ * result, which a reader with only the vessel's journal never sees. One line per selection that
+ * held arms out, was a probe, had the gate stand aside, or was rescued by a fallback; none for an
+ * ordinary ungated, unrescued selection, so the journal is not flooded. Model and provider ids
+ * only: no prompt text, no key material. The [llm-gate] prefix is used nowhere else. */
+export function gateLogLine(
+  provider: string | null, model: string, meta: Record<string, unknown>, result: Record<string, unknown>,
+): string | null {
+  const gated = Array.isArray(meta.gated) && meta.gated.length > 0;
+  const probe = typeof meta.probe === "string";
+  const bypassed = meta.gate_bypassed === true;
+  const served = typeof result.fallback_from === "string" && typeof result.served_model === "string" ? result.served_model : null;
+  if (!gated && !probe && !bypassed && served === null) return null;
+  return `[llm-gate] provider=${provider ?? "unknown"} model=${model} gated=${gated} probe=${probe} gate_bypassed=${bypassed} served_model=${served ?? "-"}`;
+}
+
 /** The vessel's one tracker, shared by index.ts (which feeds and serves it) and the selector. */
 export const providerStanding = new ProviderStandingTracker();

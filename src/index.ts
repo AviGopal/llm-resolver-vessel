@@ -45,7 +45,7 @@ import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderSt
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { ToolResultBudget } from "./tool-result-bound.js";
 import { decideLastResort } from "./last-resort.js";
-import { providerStanding, type StandingEntry } from "./provider-standing.js";
+import { providerStanding, gateLogLine, type StandingEntry } from "./provider-standing.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -1395,6 +1395,9 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
   const result = await llmCompletionHandler({ ...ctx, body: { ...body, model: sel.model } } as never);
   try {
     (result as Record<string, unknown>).model_selection = sel.meta;
+    // The gate's decisions and a rescue's served model, in the journal (provider-standing.ts).
+    const gateLine = gateLogLine(providerStanding.providerOf(sel.model), sel.model, sel.meta, result as Record<string, unknown>);
+    if (gateLine) console.log(gateLine);
     // HONESTY (2026-07-31): drafting task-types grade on resolved===true = "the LLM answered",
     // which measures RESPONSIVENESS, not edit CAPABILITY — it false-inflates fast-but-weak arms
     // (haiku patch_with_tools 4020/36) and starves capable ones, so "auto" converges on a weak
