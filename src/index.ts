@@ -40,7 +40,7 @@ import {
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall, type ToolDispatchRoute } from "./tool-dispatch";
-import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError } from "./provider-errors.js";
+import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError, isPermanentModelError, escalatedCooldownMs } from "./provider-errors.js";
 import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { ToolResultBudget } from "./tool-result-bound.js";
@@ -922,8 +922,10 @@ function wireProviderIdOf(client: OpenAI | null): string {
 async function resolveWithOpenAI(body: LlmCompletionRequest, client: OpenAI | null = openaiClient): Promise<Record<string, unknown>> {
   const r = await resolveWithOpenAIUnobserved(body, client);
   const model = body.model ?? DEFAULT_MODEL;
-  if (r.resolved === true) providerStanding.recordServed(wireProviderIdOf(client), model);
-  else providerStanding.recordFailure(wireProviderIdOf(client), model, r.error, Date.now());
+  if (r.resolved === true) {
+    providerStanding.recordServed(wireProviderIdOf(client), model);
+    clearModelEscalation(model);
+  } else providerStanding.recordFailure(wireProviderIdOf(client), model, r.error, Date.now());
   return r;
 }
 
@@ -980,6 +982,13 @@ const RATE_LIMIT_COOLDOWN_MS =
   Number.parseInt(process.env.LLM_RATE_LIMIT_COOLDOWN_MS ?? "", 10) > 0
     ? Number.parseInt(process.env.LLM_RATE_LIMIT_COOLDOWN_MS ?? "", 10)
     : 45 * 1000;
+// Permanent-class model errors (paid-only / unavailable / unknown model id) ESCALATE
+// per model: the Nth consecutive one cools that model for the exhaustion window
+// times DOUBLING^(N-1), capped at CAP. A model that will never serve us stops being
+// re-drawn every ten minutes; a success on it resets the streak. Named defaults,
+// not env knobs — the follow-on is carrying model availability as a shaped impulse.
+const PERMANENT_COOLDOWN_DOUBLING = 2;
+const PERMANENT_COOLDOWN_CAP_MS = 24 * 60 * 60 * 1000;
 const exhaustedUntil = new Map<string, number>();
 const providerKeyOf = (client: OpenAI): string => String((client as { baseURL?: unknown }).baseURL ?? "openai-wire");
 const inCooldown = (key: string): boolean => (exhaustedUntil.get(key) ?? 0) > Date.now();
@@ -1061,6 +1070,24 @@ const cooldownMsFor = (e: unknown): number => {
 // MODEL; siblings on the same client stay eligible.
 const modelExhaustedUntil = new Map<string, number>();
 const inModelCooldown = (m: string): boolean => (modelExhaustedUntil.get(m) ?? 0) > Date.now();
+// Consecutive permanent-class errors per model, beside the window they size. Only a
+// permanent-class error increments it; any other failure leaves it alone (a 429
+// says nothing about whether the slug became servable); only a success resets it.
+const modelPermanentStreak = new Map<string, number>();
+const modelCooldownMsFor = (model: string, e: unknown): number => {
+  // Billing and transient rate-limit causes keep today's windows exactly, and are
+  // checked first so a 402/429 that also says "paid" or "unavailable" is sized as such.
+  if (isHardExhaustedError(e) || isRateLimitError(e) || !isPermanentModelError(e)) return cooldownMsFor(e);
+  const streak = (modelPermanentStreak.get(model) ?? 0) + 1;
+  modelPermanentStreak.set(model, streak);
+  return escalatedCooldownMs(EXHAUSTION_COOLDOWN_MS, streak, {
+    doubling: PERMANENT_COOLDOWN_DOUBLING,
+    capMs: PERMANENT_COOLDOWN_CAP_MS,
+  });
+};
+const clearModelEscalation = (model: string): void => {
+  modelPermanentStreak.delete(model);
+};
 
 // Warm state of the scale-to-zero lane. RunPod reports worker counts on /health
 // WITHOUT dispatching a job, so polling never wakes — or bills — the endpoint.
@@ -1217,7 +1244,7 @@ const walkFallbackModels = async (
     }
     if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
     if (fb.dispatch_budget_exhausted === true) return fb; // the dispatch's allowance is spent for every model too
-    if (isFailoverError(fb.error)) markModelExhausted(fbModel, cooldownMsFor(fb.error));
+    if (isFailoverError(fb.error)) markModelExhausted(fbModel, modelCooldownMsFor(fbModel, fb.error));
   }
   return null;
 };
@@ -1238,7 +1265,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
     }
     const r = await resolveWithOpenAI(body, wireClient);
     if (r.resolved === true || !isFailoverError(r.error)) return r;
-    markModelExhausted(model, cooldownMsFor(r.error));
+    markModelExhausted(model, modelCooldownMsFor(model, r.error));
     const walked = await walkFallbackModels(body, model);
     return walked ?? r;
   }
@@ -1246,7 +1273,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   if (openrouterClient && model.includes("/") && !model.toLowerCase().startsWith("anthropic/")) {
     const r = await resolveWithOpenAI(body, openrouterClient);
     if (r.resolved === true || !isFailoverError(r.error)) return r;
-    markModelExhausted(model, cooldownMsFor(r.error));
+    markModelExhausted(model, modelCooldownMsFor(model, r.error));
     const walked = await walkFallbackModels(body, model);
     return walked ?? r;
   }

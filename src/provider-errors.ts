@@ -36,14 +36,33 @@ export const isExhaustedProviderError = (e: unknown): boolean => {
     // 429 as a standalone status code only (regex-guarded like 402 above so a
     // token count like "14290" cannot false-positive a healthy provider).
     /(?:^|[^0-9])429(?:[^0-9]|$)/.test(m) ||
-    // A "free" model that 404s with "unavailable for free / use the paid slug /
-    // no endpoints" (openrouter free-tier drift) is dead to US — cool the MODEL
-    // so the failover walk fires and the quota-gate de-advertises the arm,
-    // instead of sinking the dispatch in ~30ms and keeping a dead arm falsely
-    // advertised (which strands a spoke on its dead local arm instead of routing
-    // through discovery to a quota-having producer). Narrowed to a standalone 404
-    // AND a paid/unavailable phrase so a genuine wrong-model 404 on a healthy
-    // provider does not cool the whole lane.
+    // A paid-only / unavailable model is exhaustion for FAILOVER purposes (cool the
+    // model, walk the fallbacks, de-advertise the arm) — but it is its own class for
+    // the COOLDOWN, see isPermanentModelError below.
+    isPermanentModelError(e)
+  );
+};
+
+// A PERMANENT-CLASS MODEL ERROR: the provider says this model id will not serve
+// us at all — not "not now", but "not on this account / not under this slug".
+//
+// A "free" model that 404s with "unavailable for free / use the paid slug / no
+// endpoints" (openrouter free-tier drift) is dead to US — cool the MODEL so the
+// failover walk fires and the quota-gate de-advertises the arm, instead of
+// sinking the dispatch in ~30ms and keeping a dead arm falsely advertised (which
+// strands a spoke on its dead local arm instead of routing through discovery to a
+// quota-having producer). Narrowed to a standalone 404 AND a paid/unavailable
+// phrase so a genuine wrong-model 404 on a healthy provider does not cool the
+// whole lane. An unknown model id is the same class: it does not heal by waiting.
+//
+// It was classified as plain exhaustion and so got the fixed exhaustion window,
+// after which the selector re-drew the same dead arm and paid one failure plus
+// one fallback hop per window, indefinitely. Separating the class lets the caller
+// ESCALATE the per-model window on consecutive permanent errors (see
+// escalatedCooldownMs) while transient rate-limits keep their short window.
+export const isPermanentModelError = (e: unknown): boolean => {
+  const m = String(e ?? "").toLowerCase();
+  return (
     (/(?:^|[^0-9])404(?:[^0-9]|$)/.test(m) &&
       (m.includes("unavailable") ||
         m.includes("paid") ||
@@ -53,6 +72,20 @@ export const isExhaustedProviderError = (e: unknown): boolean => {
     m.includes("model_not_found") ||
     m.includes("invalid model id")
   );
+};
+
+// The cooldown window for the Nth CONSECUTIVE permanent-class error on one model:
+// the base window, multiplied by `doubling` for each repeat, never above `capMs`.
+// consecutive = 1 is exactly the base window, so a single paid-only 404 cools the
+// model for no longer than it did before escalation existed.
+export const escalatedCooldownMs = (
+  baseMs: number,
+  consecutive: number,
+  opts: { doubling: number; capMs: number },
+): number => {
+  const n = Math.max(1, Math.floor(consecutive));
+  const ms = baseMs * Math.pow(opts.doubling, n - 1);
+  return Number.isFinite(ms) ? Math.min(ms, opts.capMs) : opts.capMs;
 };
 
 // Reachability failures — distinct from billing exhaustion. A self-hosted vLLM
