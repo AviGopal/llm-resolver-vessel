@@ -41,6 +41,7 @@ import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall, type ToolDispatchRoute } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError, isPermanentModelError, escalatedCooldownMs } from "./provider-errors.js";
+import { isBlankText, reasoningPresent, emptyCompletionRefusal, isEmptyCompletion, emptyArmsOf, withEmptyArms } from "./empty-completion";
 import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { ToolResultBudget } from "./tool-result-bound.js";
@@ -574,6 +575,16 @@ async function anthropicCreditFallback(
     if ("refused" in budgeted) return dispatchBudgetRefusal(body, fallbackModel, budgeted.refused);
     const completion = budgeted.response;
     const content = completion.choices?.[0]?.message?.content ?? "";
+    if (isBlankText(completion.choices?.[0]?.message?.content)) {
+      // An empty from the wire model is that model's failure, not a rescue: it names the model
+      // that served it, and the resolver walks on (no fallback_from: anthropic is not credited).
+      return emptyCompletionRefusal({
+        provider: "openai-wire", model: fallbackModel, served_model: fallbackModel, requested_model: body.model ?? DEFAULT_MODEL,
+        stop_reason: completion.choices?.[0]?.finish_reason ?? null, completion_tokens: completion.usage?.completion_tokens ?? 0,
+        iterations: 1, reasoning_present: reasoningPresent(completion.choices?.[0]?.message), resolver: VESSEL_ID,
+        execution_id: body.execution_id, dispatch_id: body.dispatch_id,
+      }, { empty_arms: [fallbackModel], usage: { input_tokens: completion.usage?.prompt_tokens ?? 0, output_tokens: completion.usage?.completion_tokens ?? 0 } });
+    }
     return {
       resolved: true, shape: "llmCompletion", content,
       provider: "openai-wire", model: fallbackModel,
@@ -664,6 +675,14 @@ async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promi
         .filter((b) => b.type === "text")
         .map((b) => (b as { type: "text"; text: string }).text)
         .join("");
+      if (isBlankText(content)) {
+        return emptyCompletionRefusal({
+          provider: "anthropic", model, served_model: rawModel, requested_model: rawModel,
+          stop_reason: response.stop_reason ?? null, completion_tokens: response.usage.output_tokens,
+          iterations: 1, reasoning_present: reasoningPresent(response), resolver: VESSEL_ID,
+          execution_id: body.execution_id, dispatch_id: body.dispatch_id,
+        }, { usage: { input_tokens: response.usage.input_tokens, output_tokens: response.usage.output_tokens } });
+      }
       return {
         resolved: true, shape: "llmCompletion", content,
         provider: "anthropic", model,
@@ -706,6 +725,8 @@ async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promi
   const toolCalls: ToolCallTraceEntry[] = [];
   let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
   let totalCacheReadTokens = 0, totalCacheWriteTokens = 0;
+  // The last turn's stop reason and reasoning, and the turns taken: what tells an empty's causes apart.
+  let turns = 0, lastStopReason: string | null = null, lastReasoning = false;
   // Every tool result is re-sent on every later turn: bound each one and their per-request total.
   const toolResultBudget = new ToolResultBudget(await readToolResultLimits());
 
@@ -739,6 +760,7 @@ async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promi
     totalCacheReadTokens += (response.usage as { cache_read_input_tokens?: number }).cache_read_input_tokens ?? 0;
     totalCacheWriteTokens += (response.usage as { cache_creation_input_tokens?: number }).cache_creation_input_tokens ?? 0;
     messages.push({ role: "assistant", content: response.content });
+    turns = iter; lastStopReason = response.stop_reason ?? null; lastReasoning = reasoningPresent(response);
     if (response.stop_reason !== "tool_use") {
       finalText = response.content.filter((b) => b.type === "text").map((b) => (b as { type: "text"; text: string }).text).join("");
       break;
@@ -752,6 +774,16 @@ async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promi
       toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: toolResultBudget.bound(tu.name, tu.input, r), ...(r.ok ? {} : { is_error: true }) });
     }
     messages.push({ role: "user", content: toolResults });
+  }
+  // Blank final text — an empty last turn, or the iteration cap reached with no final turn — is
+  // an empty completion, not an answer.
+  if (isBlankText(finalText)) {
+    return emptyCompletionRefusal({
+      provider: "anthropic", model, served_model: rawModel, requested_model: rawModel,
+      stop_reason: lastStopReason, completion_tokens: totalOutputTokens, iterations: turns,
+      reasoning_present: lastReasoning, resolver: VESSEL_ID,
+      execution_id: body.execution_id, dispatch_id: body.dispatch_id,
+    }, { tool_calls: toolCalls, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens } });
   }
   return {
     resolved: true, shape: "llmCompletion", content: finalText,
@@ -799,6 +831,14 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
       if ("refused" in budgeted) return dispatchBudgetRefusal(body, model, budgeted.refused);
       const response = budgeted.response;
       const content = response.choices[0]?.message?.content ?? "";
+      if (isBlankText(response.choices[0]?.message?.content)) {
+        return emptyCompletionRefusal({
+          provider: "openai", model, served_model: rawModel, requested_model: rawModel,
+          stop_reason: response.choices[0]?.finish_reason ?? null, completion_tokens: response.usage?.completion_tokens ?? 0,
+          iterations: 1, reasoning_present: reasoningPresent(response.choices[0]?.message), resolver: VESSEL_ID,
+          execution_id: body.execution_id, dispatch_id: body.dispatch_id,
+        }, { usage: { input_tokens: response.usage?.prompt_tokens ?? 0, output_tokens: response.usage?.completion_tokens ?? 0 } });
+      }
       return {
         resolved: true, shape: "llmCompletion", content,
         provider: "openai", model,
@@ -844,6 +884,8 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
   ];
   const toolCalls: ToolCallTraceEntry[] = [];
   let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
+  // The last turn's finish_reason and reasoning, and the turns taken: what tells an empty's causes apart.
+  let turns = 0, lastStopReason: string | null = null, lastReasoning = false;
   // Every tool result is re-sent on every later turn: bound each one and their per-request total.
   const toolResultBudget = new ToolResultBudget(await readToolResultLimits());
 
@@ -878,6 +920,7 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
     const choice = response.choices?.[0]; if (!choice) return { resolved: false, shape: "choicesMissingFromProviderResponse", body: { error: "Provider response missing required choices array" } };
     if (!choice) break;
     messages.push(choice.message);
+    turns = iter; lastStopReason = choice.finish_reason ?? null; lastReasoning = reasoningPresent(choice.message);
 
     if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls?.length) {
       finalText = choice.message.content ?? "";
@@ -899,6 +942,17 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
       });
     }
     messages.push(...toolResultMessages);
+  }
+
+  // Blank final text — an empty last turn, or the iteration cap reached with no final turn — is
+  // an empty completion, not an answer.
+  if (isBlankText(finalText)) {
+    return emptyCompletionRefusal({
+      provider: "openai", model, served_model: rawModel, requested_model: rawModel,
+      stop_reason: lastStopReason, completion_tokens: totalOutputTokens, iterations: turns,
+      reasoning_present: lastReasoning, resolver: VESSEL_ID,
+      execution_id: body.execution_id, dispatch_id: body.dispatch_id,
+    }, { tool_calls: toolCalls, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens } });
   }
 
   return {
@@ -1219,11 +1273,17 @@ const markModelExhausted = (m: string, ms: number = EXHAUSTION_COOLDOWN_MS): voi
 // Shared billing-exhaustion fallback: walk every keyed wire model not in its
 // own cooldown, in the shaped llmModelPolicy.fallback_order, then registry
 // order (paid tiers first, :free last resort) for the rest.
+//
+// It is also the walk past an EMPTY COMPLETION (empty-completion.ts). `empties` is the dispatch's
+// list of arms that answered empty: they are skipped, a fallback that answers empty joins it (and is
+// not cooled: an empty is the model's quality failure, not its provider's), and a rescue carries it
+// as `empty_arms`, so the learner can charge the arms that answered empty and nothing else.
 const walkFallbackModels = async (
   body: LlmCompletionRequest,
   fromModel: string,
+  empties: string[] = [],
 ): Promise<Record<string, unknown> | null> => {
-  const tried = new Set<string>([fromModel]);
+  const tried = new Set<string>([fromModel, ...empties]);
   const gate = await readGateParams();
   const order = fallbackWalkOrder([...modelClientMap.keys()], await readFallbackOrder());
   for (const fbModel of order) {
@@ -1240,8 +1300,9 @@ const walkFallbackModels = async (
       providerStanding.recordFallback(fromModel, fbModel);
       // served_model is the arm id (fb.model is the wire id, "openai/" stripped): the response
       // says which model served, and the policy grade credits it instead of fromModel.
-      return { ...fb, fallback_from: fromModel, served_model: fbModel };
+      return withEmptyArms({ ...fb, fallback_from: fromModel, served_model: fbModel }, empties);
     }
+    if (isEmptyCompletion(fb)) { empties.push(...emptyArmsOf(fb)); continue; }
     if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
     if (fb.dispatch_budget_exhausted === true) return fb; // the dispatch's allowance is spent for every model too
     if (isFailoverError(fb.error)) markModelExhausted(fbModel, modelCooldownMsFor(fbModel, fb.error));
@@ -1257,25 +1318,36 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   }
 
   const model = body.model ?? DEFAULT_MODEL;
+  // The arms that answered empty in this dispatch (empty-completion.ts): an empty is walked past
+  // like a provider failure, but nothing is cooled for it.
+  const empties: string[] = [];
   const wireClient = modelClientMap.get(model);
   if (wireClient) {
     if (inModelCooldown(model)) {
-      const walked = await walkFallbackModels(body, model);
+      const walked = await walkFallbackModels(body, model, empties);
       if (walked) return walked;
     }
     const r = await resolveWithOpenAI(body, wireClient);
-    if (r.resolved === true || !isFailoverError(r.error)) return r;
+    if (isEmptyCompletion(r)) {
+      empties.push(...emptyArmsOf(r));
+      return (await walkFallbackModels(body, model, empties)) ?? withEmptyArms(r, empties);
+    }
+    if (r.resolved === true || !isFailoverError(r.error)) return withEmptyArms(r, empties);
     markModelExhausted(model, modelCooldownMsFor(model, r.error));
-    const walked = await walkFallbackModels(body, model);
-    return walked ?? r;
+    const walked = await walkFallbackModels(body, model, empties);
+    return walked ?? withEmptyArms(r, empties);
   }
   // Any vendor/model id not explicitly mapped routes through OpenRouter when keyed.
   if (openrouterClient && model.includes("/") && !model.toLowerCase().startsWith("anthropic/")) {
     const r = await resolveWithOpenAI(body, openrouterClient);
+    if (isEmptyCompletion(r)) {
+      empties.push(...emptyArmsOf(r));
+      return (await walkFallbackModels(body, model, empties)) ?? withEmptyArms(r, empties);
+    }
     if (r.resolved === true || !isFailoverError(r.error)) return r;
     markModelExhausted(model, modelCooldownMsFor(model, r.error));
-    const walked = await walkFallbackModels(body, model);
-    return walked ?? r;
+    const walked = await walkFallbackModels(body, model, empties);
+    return walked ?? withEmptyArms(r, empties);
   }
   const provider = pickProvider(model, body.provider);
 
@@ -1308,8 +1380,10 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
       markExhausted(primaryKey, cooldownMsFor(result.error));
     }
   }
-  if (result.resolved !== true && (primaryCoolingDown || isFailoverError(result.error))) {
-    const walked = await walkFallbackModels(body, model);
+  // An empty from the primary is walked past too, without cooling the primary.
+  if (isEmptyCompletion(result)) empties.push(...emptyArmsOf(result));
+  if (result.resolved !== true && (primaryCoolingDown || isFailoverError(result.error) || isEmptyCompletion(result))) {
+    const walked = await walkFallbackModels(body, model, empties);
     if (walked) return walked;
     // Last resort: every fallback lane is dead or cooling down — try the
     // primary anyway even mid-cooldown (its balance may have just returned).
@@ -1320,10 +1394,10 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
         return retry;
       }
       if (isFailoverError(retry.error)) markExhausted(primaryKey, cooldownMsFor(retry.error));
-      return retry;
+      return withEmptyArms(retry, empties);
     }
   }
-  return result;
+  return withEmptyArms(result, empties);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1596,7 +1670,8 @@ const llmCompletionMeteredHandler: ResolverHandler = async (ctx) => {
   try {
     const r = result as Record<string, unknown>;
     const usage = r.usage as { input_tokens?: number; output_tokens?: number; cost_usd?: number } | undefined;
-    if (r.resolved === true && usage && typeof usage === "object") {
+    // An empty completion spent its tokens too (it carries usage), so it is metered like an answer.
+    if ((r.resolved === true || isEmptyCompletion(r)) && usage && typeof usage === "object") {
       const body = ctx.body as LlmCompletionRequest;
       const model = typeof r.model === "string" ? r.model : String(body.model ?? DEFAULT_MODEL);
       const inTok = Number(usage.input_tokens ?? 0);
