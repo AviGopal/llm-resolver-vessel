@@ -41,7 +41,7 @@ import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall, type ToolDispatchRoute } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError, isPermanentModelError, escalatedCooldownMs } from "./provider-errors.js";
-import { isBlankText, reasoningPresent, emptyCompletionRefusal, isEmptyCompletion, emptyArmsOf, withEmptyArms } from "./empty-completion";
+import { isBlankText, reasoningPresent, emptyCompletionRefusal, isEmptyCompletion, emptyArmsOf, withEmptyArms, completionAnswered, emptyArmsToCharge } from "./empty-completion";
 import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { ToolResultBudget } from "./tool-result-bound.js";
@@ -1404,6 +1404,10 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
 // VesselDaemon
 // ─────────────────────────────────────────────────────────────────────────────
 
+// An arm that answered empty is charged one ok:false: an empty is the model's own (quality) failure.
+const chargeEmptyCompletion = (model: string, taskType: string | undefined): Promise<void> =>
+  recordArmOutcome(model, false, taskType);
+
 // Policy-selected completion: when the caller does not pin a model (absent or
 // "auto"), select one by cost/reach/uncertainty (Thompson over the shaped
 // llmModelPolicy) and record the choice + technical outcome. Pinned calls pass
@@ -1539,13 +1543,18 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
     // CREDIT THE ARM THAT SERVED. A fallback rescue returns resolved:true for a call sel.model
     // failed; grading sel.model on it gave the failed arm alpha (servedArmOf, model-policy.ts).
     const servedModel = servedArmOf(sel.model, result as Record<string, unknown>);
+    // AN EMPTY ANSWER IS NOT A SUCCESS. The grade is "answered": resolved AND non-blank text
+    // (empty-completion.ts), so a blank answer from any path cannot earn alpha.
+    const answered = completionAnswered(result as Record<string, unknown>);
+    let gradedModel: string | null = null;
     if (!DRAFTING_TASK_TYPES.has(body.task_type ?? "") && !providerLevelFailure && !budgetRefusal && servedModel !== null) {
+      gradedModel = servedModel;
       if (servedModel === sel.model) {
         // The drawn arm answered: grade it on its own answer.
-        await recordArmOutcome(sel.model, (result as { resolved?: boolean }).resolved === true, body.task_type);
+        await recordArmOutcome(sel.model, answered, body.task_type);
       } else {
         // A fallback answered in its place: credit the server; the drawn arm is left unchanged.
-        await recordArmOutcome(servedModel, (result as { resolved?: boolean }).resolved === true, body.task_type);
+        await recordArmOutcome(servedModel, answered, body.task_type);
       }
     } else if (providerLevelFailure) {
       console.log(
@@ -1553,6 +1562,12 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
       );
     } else if (servedModel === null) {
       console.log(`[llm-resolver-vessel] NOT grading ${sel.model} — a fallback served it and did not name the model`);
+    }
+    // Every OTHER arm that answered empty in this dispatch (a drawn arm a fallback then rescued, a
+    // fallback the walk moved past) is charged one ok:false: the empty is that model's own output.
+    // An exhausted or probed drawn arm that never answered is not among them, so it stays ungraded.
+    if (!DRAFTING_TASK_TYPES.has(body.task_type ?? "")) {
+      for (const m of emptyArmsToCharge(result as Record<string, unknown>, gradedModel)) await chargeEmptyCompletion(m, body.task_type);
     }
   } catch (err) {
     console.warn("[llm-resolver-vessel] policy outcome record failed (non-fatal):", err);

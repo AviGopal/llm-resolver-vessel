@@ -330,8 +330,16 @@ export async function recordArmOutcome(model: string, ok: boolean, taskType?: st
  *
  * So a fallback-served result is graded against `served_model` (the arm id the fallback reports)
  * and never against `selected`. A fallback result that does not name what served it returns null:
- * grade nothing rather than guess. */
+ * grade nothing rather than guess.
+ *
+ * An empty-completion refusal names the arm that returned the empty in `served_model`, which is not
+ * always `selected` (the anthropic credit-dead wire fallback serves under the claude arm's draw), so
+ * it is graded against that arm. ("empty_completion" is empty-completion.ts's EMPTY_COMPLETION; this
+ * module keeps no runtime relative imports.) */
 export function servedArmOf(selected: string, result: Record<string, unknown>): string | null {
+  if (result.error === "empty_completion" && typeof result.served_model === "string" && result.served_model.length > 0) {
+    return result.served_model;
+  }
   if (typeof result.fallback_from !== "string") return selected;
   return typeof result.served_model === "string" && result.served_model.length > 0 ? result.served_model : null;
 }

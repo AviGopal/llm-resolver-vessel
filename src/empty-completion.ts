@@ -99,3 +99,15 @@ export function withEmptyArms(result: Record<string, unknown>, empties: readonly
   if (empties.length === 0) return result;
   return { ...result, empty_arms: [...new Set(empties)] };
 }
+
+/** The learner's success: resolved AND non-blank text. A blank answer is never a success, whichever
+ * path produced it. */
+export function completionAnswered(result: Record<string, unknown>): boolean {
+  return result.resolved === true && !isBlankText(result.content);
+}
+
+/** The arms to charge one ok:false for answering empty in this dispatch: every arm in the result's
+ * empty list, once, except `graded` — the arm the main grade already recorded for this result. */
+export function emptyArmsToCharge(result: Record<string, unknown>, graded: string | null): string[] {
+  return [...new Set(emptyArmsOf(result))].filter((m) => m !== graded);
+}
