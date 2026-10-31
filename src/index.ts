@@ -151,7 +151,9 @@ const RUNPOD_COST_PER_MTOK = ((): number => {
 // OpenAI-wire-compatible provider registry: add a service as data, not a new code path.
 // defaultKey lets a keyless self-hosted endpoint (vLLM with no --api-key) still
 // construct an OpenAI client, which requires a non-empty apiKey string.
-interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; models: string[]; defaultKey?: string; }
+// routeOnly: models in `models` that are routable (modelClientMap, fallback walk, explicit pins)
+// but get NO policy arm at startup, so selection cannot draw them until they have earned one.
+interface OpenAiWireProvider { id: string; baseURL: string; apiKeyEnv: string; models: string[]; defaultKey?: string; routeOnly?: string[]; }
 const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
   // FUNDED quota providers (groq + mistral) placed HIGH so the exhaustion
   // failover walk reaches them before the rate-limited openrouter-free / gemini
@@ -191,7 +193,12 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
              "anthropic/claude-opus-5.5", "moonshotai/kimi-k3.1-pro", "openai/gpt-6.1-sol",
              "deepseek/deepseek-v4.1-flash-1017", "anthropic/claude-haiku-5.5", "deepseek/deepseek-v4.1-flash",
              "z-ai/glm-5.3-flash", "openai/gpt-6-luna", "minimax/minimax-m3.1-flash",
-             "nvidia/nemotron-3.5-lightning"] },
+             "nvidia/nemotron-3.5-lightning"],
+    // Route-only until per-task correctness grading exists: a fresh alpha1/beta1 arm would be
+    // eligible for format-graded tasks it has never been graded on. Like `models`, a source
+    // constant (the same bootstrap debt as the routable set itself).
+    routeOnly: ["anthropic/claude-haiku-5.5", "deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash",
+                "openai/gpt-6-luna", "minimax/minimax-m3.1-flash", "nvidia/nemotron-3.5-lightning"] },
   { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
     models: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-flash-preview"] },
   // LAST in the registry on purpose: the exhaustion failover walk reads this
@@ -1837,6 +1844,8 @@ const FUNDED_ARM_COST: Record<string, number> = {
   "deepseek/deepseek-chat-v3-0324": 0.3,
   "nvidia/nemotron-3-ultra-550b-a55b:free": 0, "nvidia/nemotron-3-nano-30b-a3b:free": 0,
   "cohere/north-mini-code:free": 0,
+  "anthropic/claude-opus-5.5": 4, "moonshotai/kimi-k3.1-pro": 2, "openai/gpt-6.1-sol": 2,
+  "deepseek/deepseek-v4.1-flash-1017": 0.15,
 };
 // DERIVE the providers to seed rather than hardcoding a list.
 //
@@ -1858,6 +1867,7 @@ for (const provId of OPENAI_WIRE_PROVIDERS.map((pr) => pr.id).filter((id) => !SE
   if (!prov || !cleanEnv(process.env[prov.apiKeyEnv])) continue;
   let seeded = 0;
   for (const m of prov.models) {
+    if (prov.routeOnly?.includes(m)) continue;
     try { seeded += await ensureArmsForModels([m], FUNDED_ARM_COST[m] ?? 0.6, `keyed ${provId}`); }
     catch (err) { console.warn(`[llm-resolver-vessel] failed to seed ${provId} arm '${m}' (non-fatal):`, err); }
   }
