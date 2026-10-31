@@ -183,7 +183,15 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
              // every time it is drawn. Replaced with a verified code-oriented free slug.
              "cohere/north-mini-code:free",
              // Capable paid drafters (verified live on OpenRouter): reachable by policy selection for hard edits.
-             "google/gemini-2.5-pro", "openai/gpt-5"] },
+             "google/gemini-2.5-pro", "openai/gpt-5",
+             // Newer models, each id an exact slug in OpenRouter's public GET /api/v1/models
+             // (no :batch variants, no ~*-latest aliases). anthropic/ ids listed here are served
+             // through OpenRouter: registry membership puts them in modelClientMap, which every
+             // routing and willingness check reads before the direct-Anthropic prefix rule.
+             "anthropic/claude-opus-5.5", "moonshotai/kimi-k3.1-pro", "openai/gpt-6.1-sol",
+             "deepseek/deepseek-v4.1-flash-1017", "anthropic/claude-haiku-5.5", "deepseek/deepseek-v4.1-flash",
+             "z-ai/glm-5.3-flash", "openai/gpt-6-luna", "minimax/minimax-m3.1-flash",
+             "nvidia/nemotron-3.5-lightning"] },
   { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
     models: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-flash-preview"] },
   // LAST in the registry on purpose: the exhaustion failover walk reads this
