@@ -20,14 +20,13 @@
 //
 // The code under test is index.ts's own (completion-chain-harness.ts loads it from the syntax tree).
 import { describe, expect, test } from "bun:test";
-import { completionChain, textTurn, toolCallTurn } from "./completion-chain-harness";
+import { completionChain, textTurn } from "./completion-chain-harness";
 import { isFailoverError } from "./provider-errors";
 import { classifyStandingError } from "./provider-standing";
 
 const X = "x/free-arm:free";
 const Y = "y/paid-arm";
 const Z = "z/paid-arm";
-const TOOLS = [{ name: "read_file", description: "read a file", input_schema: { type: "object", properties: {} } }];
 const REASONING = "Let me think about this step by step. The user wants SECRET-REASONING-TEXT";
 const body = (extra: Record<string, unknown> = {}) => ({ type: "llm_completion", prompt: "write the function", ...extra });
 

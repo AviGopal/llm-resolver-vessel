@@ -40,7 +40,7 @@ import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError, isPermanentModelError, escalatedCooldownMs } from "./provider-errors.js";
 import { isBlankText, reasoningPresent, emptyCompletionRefusal, isEmptyCompletion, emptyArmsOf, withEmptyArms, completionAnswered, emptyArmsToCharge } from "./empty-completion";
-import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
+import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { decideLastResort } from "./last-resort.js";
 import { providerStanding, gateLogLine, type StandingEntry } from "./provider-standing.js";
@@ -393,18 +393,9 @@ interface LlmCompletionRequest {
   system?: string;
   images?: Array<{ media_type: string; data: string }>;
   tools?: AnthropicToolDef[];
-  max_tool_iterations?: number;
   execution_id?: string;
   dispatch_id?: string;
   caller?: string;
-}
-
-interface ToolCallTraceEntry {
-  iteration: number;
-  tool_name: string;
-  tool_input: unknown;
-  tool_output: unknown;
-  duration_ms: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -476,13 +467,6 @@ async function anthropicCreditFallback(
 // Prompt caching (Anthropic path)
 //
 // Caching is a byte-prefix match; render order is tools → system → messages.
-// The tool-use loop below re-sends the full growing history every iteration
-// (up to max_tool_iterations), so caching the shared prefix is the real win:
-// system gets a stable breakpoint, and a single sliding breakpoint rides the
-// last block of the last message each iteration (max 4 markers per request —
-// we use at most 2). Prefixes below the model's minimum (1k–4k tokens)
-// silently don't cache, which is harmless. Cache reads report in
-// usage.cache_read_input_tokens.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CACHE_EPHEMERAL = { type: "ephemeral" as const };
@@ -490,26 +474,6 @@ const CACHE_EPHEMERAL = { type: "ephemeral" as const };
 function cachedSystem(system: string | undefined): Record<string, unknown> {
   if (!system) return {};
   return { system: [{ type: "text", text: system, cache_control: CACHE_EPHEMERAL }] };
-}
-
-// Move the message-side breakpoint to the last block of the last message,
-// clearing any marker set on a previous iteration so we never exceed the
-// 4-breakpoint request limit as the loop grows the history.
-function slideCacheBreakpoint(messages: Array<{ role: string; content: unknown }>): void {
-  for (const m of messages) {
-    if (Array.isArray(m.content)) {
-      for (const b of m.content) {
-        if (b && typeof b === "object" && "cache_control" in (b as Record<string, unknown>)) {
-          delete (b as Record<string, unknown>)["cache_control"];
-        }
-      }
-    }
-  }
-  const last = messages[messages.length - 1];
-  if (last && Array.isArray(last.content) && last.content.length > 0) {
-    const b = last.content[last.content.length - 1];
-    if (b && typeof b === "object") (b as Record<string, unknown>)["cache_control"] = CACHE_EPHEMERAL;
-  }
 }
 
 async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promise<Record<string, unknown>> {

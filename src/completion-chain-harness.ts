@@ -19,18 +19,6 @@ export const textTurn = (content: string | null, finish_reason = "stop", extra: 
   usage: { prompt_tokens: 10, completion_tokens: 7 },
 });
 
-export const toolCallTurn = (n: number): Turn => ({
-  choices: [{
-    index: 0,
-    message: {
-      role: "assistant", content: null,
-      tool_calls: [{ id: `call_${n}`, type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: `f${n}` }) } }],
-    },
-    finish_reason: "tool_calls",
-  }],
-  usage: { prompt_tokens: 10, completion_tokens: 3 },
-});
-
 export interface ChainOptions {
   /** Wire models in registry order, each with its scripted turns (consumed in order; the last repeats). */
   models: Array<[string, Turn[]]>;
@@ -88,7 +76,6 @@ export function completionChain(opts: ChainOptions): Chain {
     VESSEL_ID: "llm-resolver-vessel-test",
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_MAX_TOKENS: 4096,
-    DEFAULT_MAX_TOOL_ITERATIONS: 20,
     openaiClient: null, openrouterClient: null, anthropic: null,
     modelClientMap,
     providerStanding: standing,
@@ -105,7 +92,6 @@ export function completionChain(opts: ChainOptions): Chain {
     readFallbackOrder: async () => undefined,
     readMaxInputTokens: async () => 1_000_000,
     readMaxInputTokensPerDispatch: async () => null,
-    readToolResultLimits: async () => ({ per_result_max_chars: 10_000, total_max_chars: 100_000 }),
     estimateInputTokens: () => 1,
     budgetedProviderCall: async (o: { call: () => Promise<unknown> }) => ({ response: await o.call() }),
     dispatchLedger: {},

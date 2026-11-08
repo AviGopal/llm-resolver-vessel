@@ -151,15 +151,6 @@ export function effectiveMaxInputTokensPerDispatch(policy: Pick<ModelPolicy, "ma
   return effectivePolicyValue(policy, "max_input_tokens_per_dispatch");
 }
 
-/** Tool-result allowances in force for one request (read once at the start of a tool loop). */
-export async function readToolResultLimits(): Promise<{ per_result_max_chars: number; total_max_chars: number }> {
-  const policy = await loadPolicy();
-  return {
-    per_result_max_chars: effectivePolicyValue(policy, "tool_result_max_chars"),
-    total_max_chars: effectivePolicyValue(policy, "tool_results_total_max_chars"),
-  };
-}
-
 /** Read at use time (loadPolicy's 10 s cache; a policy write refreshes it immediately). */
 export async function readMaxInputTokensPerDispatch(): Promise<number> {
   return effectiveMaxInputTokensPerDispatch(await loadPolicy());
