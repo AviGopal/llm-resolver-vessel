@@ -38,12 +38,10 @@ import {
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
-import { offeredToolNames, withDispatchExecutionId, toolDispatchRoute, makeToolEndpointResolver, dispatchToolCall, type ToolDispatchRoute } from "./tool-dispatch";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError, isPermanentModelError, escalatedCooldownMs } from "./provider-errors.js";
 import { isBlankText, reasoningPresent, emptyCompletionRefusal, isEmptyCompletion, emptyArmsOf, withEmptyArms, completionAnswered, emptyArmsToCharge } from "./empty-completion";
 import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch, readToolResultLimits } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
-import { ToolResultBudget } from "./tool-result-bound.js";
 import { decideLastResort } from "./last-resort.js";
 import { providerStanding, gateLogLine, type StandingEntry } from "./provider-standing.js";
 
@@ -374,24 +372,6 @@ function pickProvider(model: string, explicitProvider?: string): "anthropic" | "
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tool dispatch (shared between both provider paths)
-// ─────────────────────────────────────────────────────────────────────────────
-
-const DEFAULT_TOOL_DISPATCH_ENDPOINT =
-  process.env.LLM_TOOL_DISPATCH_ENDPOINT ?? "http://127.0.0.1:8090/v2/impulses/resolve";
-
-const resolveToolEndpoint = makeToolEndpointResolver(DISCOVERY_ENDPOINT, API_KEY);
-
-async function dispatchTool(
-  route: ToolDispatchRoute,
-  toolName: string,
-  toolInput: Record<string, unknown>,
-  offered: ReadonlySet<string>,
-): Promise<{ ok: boolean; result: unknown; error?: string }> {
-  return dispatchToolCall(resolveToolEndpoint, route, toolName, toolInput, offered);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Request types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -413,8 +393,6 @@ interface LlmCompletionRequest {
   system?: string;
   images?: Array<{ media_type: string; data: string }>;
   tools?: AnthropicToolDef[];
-  tool_dispatch_endpoint?: string;
-  tool_dispatch_api_key?: string;
   max_tool_iterations?: number;
   execution_id?: string;
   dispatch_id?: string;

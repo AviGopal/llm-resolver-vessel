@@ -9,8 +9,6 @@ import { loadIndexDeclarations } from "./index-fn-harness";
 import * as providerErrors from "./provider-errors";
 import { servedArmOf, fallbackWalkOrder } from "./model-policy";
 import { gateLogLine } from "./provider-standing";
-import { offeredToolNames, withDispatchExecutionId } from "./tool-dispatch";
-import { ToolResultBudget } from "./tool-result-bound";
 import { dispatchKeyOf } from "./dispatch-budget";
 
 /** One scripted provider turn: an OpenAI chat completion, or an Error the client throws. */
@@ -84,14 +82,13 @@ export function completionChain(opts: ChainOptions): Chain {
   };
   const stubs: Record<string, unknown> = {
     ...providerErrors,
-    servedArmOf, fallbackWalkOrder, gateLogLine, offeredToolNames, withDispatchExecutionId, ToolResultBudget, dispatchKeyOf,
+    servedArmOf, fallbackWalkOrder, gateLogLine, dispatchKeyOf,
     console: { log() {}, warn() {}, error() {} },
     process: { env: {} },
     VESSEL_ID: "llm-resolver-vessel-test",
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_MAX_TOKENS: 4096,
     DEFAULT_MAX_TOOL_ITERATIONS: 20,
-    DEFAULT_TOOL_DISPATCH_ENDPOINT: "http://tools.test",
     openaiClient: null, openrouterClient: null, anthropic: null,
     modelClientMap,
     providerStanding: standing,
@@ -112,8 +109,6 @@ export function completionChain(opts: ChainOptions): Chain {
     estimateInputTokens: () => 1,
     budgetedProviderCall: async (o: { call: () => Promise<unknown> }) => ({ response: await o.call() }),
     dispatchLedger: {},
-    toolDispatchRoute: () => ({ apiKey: "test-only" }),
-    dispatchTool: async () => ({ ok: true, result: "file contents" }),
     promptCeilingRefusal: () => ({ resolved: false, prompt_ceiling: true, error: "prompt too large" }),
     dispatchBudgetRefusal: () => ({ resolved: false, dispatch_budget_exhausted: true, error: "dispatch budget" }),
     loadPolicy: async () => ({ arms: opts.models.map(([model]) => ({ model, cost_per_mtok: 1, alpha: 1, beta: 1 })) }),
