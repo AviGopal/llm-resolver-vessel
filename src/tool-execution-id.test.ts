@@ -16,11 +16,4 @@ describe("the dispatch's execution_id always wins on a tool call", () => {
     expect(withDispatchExecutionId({ command: "ls", execution_id: "forged" }, undefined)).toEqual({ command: "ls" });
     expect(withDispatchExecutionId({ command: "ls" }, "")).toEqual({ command: "ls" });
   });
-  test("both tool loops (Anthropic and OpenAI) dispatch through it, and neither keeps the old model-wins form", () => {
-    const src = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
-    expect(src).toContain("dispatchTool(dispatchRoute, tu.name, withDispatchExecutionId(tu.input, (body as { execution_id?: unknown }).execution_id), offered)");
-    expect(src).toContain("dispatchTool(dispatchRoute, tc.function.name, withDispatchExecutionId(toolInput, (body as { execution_id?: unknown }).execution_id), offered)");
-    expect(src).not.toContain('!("execution_id" in tu.input)');
-    expect(src).not.toContain('!("execution_id" in toolInput)');
-  });
 });

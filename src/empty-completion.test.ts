@@ -64,28 +64,6 @@ describe("MUST-FAIL: blank final text is an empty_completion refusal", () => {
       expect(r.reasoning_present).toBe(false);
     }
   });
-
-  test("tool loop: an empty final turn after a tool call", async () => {
-    const { r } = await resolveOn(X, [toolCallTurn(1), textTurn(null, "length", { reasoning: REASONING })], { tools: TOOLS });
-    expect(r.resolved).toBe(false);
-    expect(r.error).toBe("empty_completion");
-    expect(r.stop_reason).toBe("length");
-    expect(r.reasoning_present).toBe(true);
-    expect(r.iterations).toBe(2);
-    expect(r.completion_tokens).toBe(10);
-    expect(JSON.stringify(r)).not.toContain("SECRET-REASONING-TEXT");
-  });
-
-  test("tool loop: 20 tool-call turns and never a final turn", async () => {
-    const turns = Array.from({ length: 25 }, (_, i) => toolCallTurn(i + 1));
-    const { r, c } = await resolveOn(X, turns, { tools: TOOLS });
-    expect(c.calls.length).toBe(20);
-    expect(r.resolved).toBe(false);
-    expect(r.error).toBe("empty_completion");
-    expect(r.iterations).toBe(20);
-    expect(r.stop_reason).toBe("tool_calls");
-    expect((r.tool_calls as unknown[]).length).toBe(20);
-  });
 });
 
 describe("MUST-FAIL: an empty fails over to the next arm, without cooling the empty one", () => {
@@ -134,15 +112,6 @@ describe("CONTROLS", () => {
       stop_reason: "stop",
     });
     expect(c.calls).toEqual([Y]);
-  });
-
-  test("a normal tool-loop answer is unchanged", async () => {
-    const { r } = await resolveOn(Y, [toolCallTurn(1), textTurn("done")], { tools: TOOLS });
-    expect(r.resolved).toBe(true);
-    expect(r.content).toBe("done");
-    expect(r.iterations).toBe(1);
-    expect(Object.keys(r).sort()).toEqual(["content", "iterations", "model", "provider", "resolved", "shape", "tool_calls", "usage"]);
-    expect(r.usage).toEqual({ input_tokens: 20, output_tokens: 10 });
   });
 
   test("an answering arm is not walked past", async () => {

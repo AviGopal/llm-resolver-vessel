@@ -138,26 +138,3 @@ describe("the allowances are read from the llmModelPolicy shape", () => {
     expect((await mp.llmModelPolicyWriteHandler({ body: { tool_results_total_max_chars: 12 } })).resolved).toBe(false);
   });
 });
-
-describe("source: both tool loops bound every tool result through the helper", () => {
-  const src = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
-
-  test("no tool result is appended verbatim any more", () => {
-    expect(src).not.toMatch(/content: typeof r\.result === "string" \? r\.result/);
-  });
-
-  test("each loop creates one budget from the policy BEFORE its first turn and bounds at its push site", () => {
-    const loops = [...src.matchAll(/for \(let iter = 1; iter <= maxIter; iter\+\+\) \{/g)].map((m) => m.index!);
-    expect(loops.length).toBe(2);
-    const creations = [...src.matchAll(/const toolResultBudget = new ToolResultBudget\(await readToolResultLimits\(\)\);/g)].map((m) => m.index!);
-    expect(creations.length).toBe(2);
-    for (let i = 0; i < 2; i++) {
-      expect(creations[i]).toBeLessThan(loops[i]!);
-      if (i > 0) expect(creations[i]).toBeGreaterThan(loops[i - 1]!);
-    }
-    const anthropicPush = src.slice(loops[0]!, loops[1]!);
-    expect(anthropicPush).toContain('toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: toolResultBudget.bound(tu.name, tu.input, r)');
-    const openaiPush = src.slice(loops[1]!, loops[1]! + 6000);
-    expect(openaiPush).toContain("content: toolResultBudget.bound(tc.function.name, toolInput, r),");
-  });
-});

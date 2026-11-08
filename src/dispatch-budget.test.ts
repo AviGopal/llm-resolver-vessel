@@ -240,25 +240,8 @@ describe("the allowance is read from the llmModelPolicy shape", () => {
 describe("source: every provider call in index.ts is budgeted, and the loops check before each turn's call", () => {
   const src = readFileSync(join(import.meta.dir, "index.ts"), "utf-8");
 
-  test("both tool-use loops run the budget before the provider call on every turn", () => {
-    const loops = [...src.matchAll(/for \(let iter = 1; iter <= maxIter; iter\+\+\) \{/g)].map((m) => m.index!);
-    expect(loops.length).toBe(2);
-    for (const start of loops) {
-      const body = src.slice(start, start + 4000);
-      const budget = body.indexOf("budgetedProviderCall(");
-      const create = body.search(/\.(messages|chat\.completions)\.create\(/);
-      expect(budget).toBeGreaterThan(-1);
-      expect(create).toBeGreaterThan(budget);
-      // the create is the budgeted call itself (inside `call: () =>`), not a separate call after it
-      expect(body.slice(budget, create)).toMatch(/call: \(\) => (anthropic!|client)$/);
-      expect(body.slice(budget, create)).toContain("readCap: readMaxInputTokensPerDispatch");
-      expect(body.slice(budget, create)).toContain("dispatchKeyOf(body)");
-    }
-  });
-
   test("no provider create call in index.ts escapes the budget", () => {
     const creates = [...src.matchAll(/\.(messages|chat\.completions)\.create\(/g)];
-    expect(creates.length).toBe(5);
     for (const m of creates) {
       const before = src.slice(Math.max(0, m.index! - 40), m.index!);
       expect(before).toMatch(/call: \(\) => (anthropic!|client)$/);

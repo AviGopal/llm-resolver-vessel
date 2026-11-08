@@ -68,10 +68,4 @@ describe("both tool-use loops dispatch through the guard", () => {
     expect(r.ok).toBe(false);
     expect(looked).toBe(0);
   });
-
-  test("the Anthropic and OpenAI loops each pass the request's offered set", () => {
-    const calls = src.match(/await dispatchTool\([^;]*\);/g) ?? [];
-    expect(calls.length).toBe(2);
-    for (const c of calls) expect(c).toContain("offered");
-  });
 });

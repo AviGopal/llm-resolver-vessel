@@ -500,7 +500,6 @@ function pickProvider(model: string, explicitProvider?: string): "anthropic" | "
 
 const DEFAULT_TOOL_DISPATCH_ENDPOINT =
   process.env.LLM_TOOL_DISPATCH_ENDPOINT ?? "http://127.0.0.1:8090/v2/impulses/resolve";
-const DEFAULT_MAX_TOOL_ITERATIONS = parseInt(process.env.LLM_MAX_TOOL_ITERATIONS ?? "20", 10);
 
 const resolveToolEndpoint = makeToolEndpointResolver(DISCOVERY_ENDPOINT, API_KEY);
 
@@ -556,7 +555,6 @@ interface ToolCallTraceEntry {
 // ─────────────────────────────────────────────────────────────────────────────
 async function anthropicCreditFallback(
   err: unknown, body: LlmCompletionRequest): Promise<Record<string, unknown> | null> {
-  if (Array.isArray(body.tools) && body.tools.length > 0) return null;
   const message = err instanceof Error ? err.message : String(err);
   const status = (err as { status?: number } | null)?.status;
   const errType = (err as { error?: { type?: string; message?: string } } | null)?.error?.type;
@@ -672,7 +670,6 @@ async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promi
       ]
     : body.prompt;
 
-  if (!body.tools || body.tools.length === 0) {
     try {
       const budgeted = await budgetedProviderCall({
         ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: estimateInputTokens(body.system, userContent),
@@ -716,102 +713,6 @@ async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promi
       console.error("[llm-resolver-vessel] anthropic error:", message);
       return { resolved: false, shape: "llmCompletion", error: message };
     }
-  }
-
-  // Tool-use loop (Anthropic)
-  // The node key goes only to the configured or a discovered endpoint, never to body.tool_dispatch_endpoint.
-  const dispatchRoute = toolDispatchRoute(body, DEFAULT_TOOL_DISPATCH_ENDPOINT, process.env.METABOB_API_KEY);
-  const dispatchApiKey = dispatchRoute.apiKey;
-  const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
-  const hasClientSideTools = body.tools.some((t) => !t.type || t.type === "custom");
-  const offered = offeredToolNames(body.tools);
-  if (hasClientSideTools && !dispatchApiKey) {
-    return { resolved: false, shape: "llmCompletion", error: "tool-use with client-side tools requires METABOB_API_KEY" };
-  }
-
-  const messages: Array<{ role: "user" | "assistant"; content: unknown }> = [
-    {
-      role: "user",
-      content: Array.isArray(userContent)
-        ? userContent
-        : [{ type: "text", text: userContent as string }],
-    },
-  ];
-  const toolCalls: ToolCallTraceEntry[] = [];
-  let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
-  let totalCacheReadTokens = 0, totalCacheWriteTokens = 0;
-  // The last turn's stop reason and reasoning, and the turns taken: what tells an empty's causes apart.
-  let turns = 0, lastStopReason: string | null = null, lastReasoning = false;
-  // Every tool result is re-sent on every later turn: bound each one and their per-request total.
-  const toolResultBudget = new ToolResultBudget(await readToolResultLimits());
-
-  for (let iter = 1; iter <= maxIter; iter++) {
-    // Prompt-size ceiling per turn: tool results are appended and re-sent every turn.
-    const turnCeiling = await readMaxInputTokens();
-    const turnEstimate = estimateInputTokens(messages, body.system, body.tools);
-    if (turnEstimate > turnCeiling) return { ...promptCeilingRefusal(body, model, turnEstimate, turnCeiling, iter), tool_calls: toolCalls };
-    let response;
-    try {
-      slideCacheBreakpoint(messages);
-      // Dispatch budget per turn: checked (and the estimate reserved) BEFORE the provider call.
-      const budgeted = await budgetedProviderCall({
-        ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: turnEstimate,
-        readCap: readMaxInputTokensPerDispatch,
-        call: () => anthropic!.messages.create({
-          model, max_tokens: maxTokens,
-          tools: body.tools as unknown as Anthropic.Messages.Tool[],
-          ...cachedSystem(body.system),
-          messages: messages as unknown as Anthropic.Messages.MessageParam[],
-        }),
-        inputTokensOf: anthropicInputTokens,
-      });
-      if ("refused" in budgeted) return { ...dispatchBudgetRefusal(body, model, budgeted.refused, iter), tool_calls: toolCalls, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens } };
-      response = budgeted.response;
-    } catch (err) {
-      return { resolved: false, shape: "llmCompletion", error: `anthropic (iter ${iter}): ${err instanceof Error ? err.message : String(err)}`, tool_calls: toolCalls };
-    }
-    totalInputTokens += response.usage.input_tokens;
-    totalOutputTokens += response.usage.output_tokens;
-    totalCacheReadTokens += (response.usage as { cache_read_input_tokens?: number }).cache_read_input_tokens ?? 0;
-    totalCacheWriteTokens += (response.usage as { cache_creation_input_tokens?: number }).cache_creation_input_tokens ?? 0;
-    messages.push({ role: "assistant", content: response.content });
-    turns = iter; lastStopReason = response.stop_reason ?? null; lastReasoning = reasoningPresent(response);
-    if (response.stop_reason !== "tool_use") {
-      finalText = response.content.filter((b) => b.type === "text").map((b) => (b as { type: "text"; text: string }).text).join("");
-      break;
-    }
-    const toolUses = response.content.filter((b) => b.type === "tool_use") as Array<{ type: "tool_use"; id: string; name: string; input: Record<string, unknown> }>;
-    const toolResults: Array<{ type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }> = [];
-    for (const tu of toolUses) {
-      const start = Date.now();
-      const r = await dispatchTool(dispatchRoute, tu.name, withDispatchExecutionId(tu.input, (body as { execution_id?: unknown }).execution_id), offered);
-      toolCalls.push({ iteration: iter, tool_name: tu.name, tool_input: tu.input, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
-      toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: toolResultBudget.bound(tu.name, tu.input, r), ...(r.ok ? {} : { is_error: true }) });
-    }
-    messages.push({ role: "user", content: toolResults });
-  }
-  // Blank final text — an empty last turn, or the iteration cap reached with no final turn — is
-  // an empty completion, not an answer.
-  if (isBlankText(finalText)) {
-    return emptyCompletionRefusal({
-      provider: "anthropic", model, served_model: rawModel, requested_model: rawModel,
-      stop_reason: lastStopReason, completion_tokens: totalOutputTokens, iterations: turns,
-      reasoning_present: lastReasoning, resolver: VESSEL_ID,
-      execution_id: body.execution_id, dispatch_id: body.dispatch_id,
-    }, { tool_calls: toolCalls, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens } });
-  }
-  return {
-    resolved: true, shape: "llmCompletion", content: finalText,
-    provider: "anthropic", model,
-    tool_calls: toolCalls,
-    iterations: toolCalls.length > 0 ? toolCalls[toolCalls.length - 1]!.iteration : 0,
-    usage: {
-      input_tokens: totalInputTokens,
-      output_tokens: totalOutputTokens,
-      cache_creation_input_tokens: totalCacheWriteTokens,
-      cache_read_input_tokens: totalCacheReadTokens,
-    },
-  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -831,7 +732,6 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
     ? [{ role: "system", content: body.system }]
     : [];
 
-  if (!body.tools || body.tools.length === 0) {
     try {
       const budgeted = await budgetedProviderCall({
         ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: estimateInputTokens(systemMessages, body.prompt),
@@ -869,114 +769,6 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
       console.error("[llm-resolver-vessel] openai error:", message);
       return { resolved: false, shape: "llmCompletion", error: message };
     }
-  }
-
-  // Tool-use loop (OpenAI format)
-  // The node key goes only to the configured or a discovered endpoint, never to body.tool_dispatch_endpoint.
-  const dispatchRoute = toolDispatchRoute(body, DEFAULT_TOOL_DISPATCH_ENDPOINT, process.env.METABOB_API_KEY);
-  const dispatchApiKey = dispatchRoute.apiKey;
-  const maxIter = Math.max(1, Math.min(body.max_tool_iterations ?? DEFAULT_MAX_TOOL_ITERATIONS, 30));
-  if (!dispatchApiKey) {
-    return { resolved: false, shape: "llmCompletion", error: "tool-use requires METABOB_API_KEY" };
-  }
-
-  // Convert Anthropic-style tool defs to OpenAI format
-  const offered = offeredToolNames(body.tools);
-  const oaiTools: OpenAI.Chat.ChatCompletionTool[] = body.tools
-    .filter((t) => !t.type || t.type === "custom")
-    .map((t) => ({
-      type: "function" as const,
-      function: {
-        name: t.name,
-        description: t.description ?? "",
-        parameters: (t.input_schema ?? { type: "object", properties: {} }) as Record<string, unknown>,
-      },
-    }));
-
-  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    ...systemMessages,
-    { role: "user", content: body.prompt },
-  ];
-  const toolCalls: ToolCallTraceEntry[] = [];
-  let totalInputTokens = 0, totalOutputTokens = 0, finalText = "";
-  // The last turn's finish_reason and reasoning, and the turns taken: what tells an empty's causes apart.
-  let turns = 0, lastStopReason: string | null = null, lastReasoning = false;
-  // Every tool result is re-sent on every later turn: bound each one and their per-request total.
-  const toolResultBudget = new ToolResultBudget(await readToolResultLimits());
-
-  for (let iter = 1; iter <= maxIter; iter++) {
-    // Prompt-size ceiling per turn: tool results are appended and re-sent every turn.
-    const turnCeiling = await readMaxInputTokens();
-    const turnEstimate = estimateInputTokens(messages, oaiTools);
-    if (turnEstimate > turnCeiling) return { ...promptCeilingRefusal(body, model, turnEstimate, turnCeiling, iter), tool_calls: toolCalls };
-    let response: OpenAI.Chat.ChatCompletion;
-    try {
-      // Dispatch budget per turn: checked (and the estimate reserved) BEFORE the provider call.
-      const budgeted = await budgetedProviderCall({
-        ledger: dispatchLedger, id: dispatchKeyOf(body), estimate: turnEstimate,
-        readCap: readMaxInputTokensPerDispatch,
-        call: () => client.chat.completions.create({
-          model, max_tokens: maxTokens, messages,
-          ...(oaiTools.length > 0 ? { tools: oaiTools } : {}),
-        }),
-        inputTokensOf: (c) => c.usage?.prompt_tokens ?? 0,
-      });
-      if ("refused" in budgeted) return { ...dispatchBudgetRefusal(body, model, budgeted.refused, iter), tool_calls: toolCalls, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens } };
-      response = budgeted.response;
-    } catch (err) {
-      return { resolved: false, shape: "llmCompletion", error: `openai (iter ${iter}): ${err instanceof Error ? err.message : String(err)}`, tool_calls: toolCalls };
-    }
-    totalInputTokens += response.usage?.prompt_tokens ?? 0;
-    totalOutputTokens += response.usage?.completion_tokens ?? 0;
-
-    if (!response.choices || response.choices.length === 0) {
-      throw new Error("choicesMissingFromProviderResponse");
-    }
-    const choice = response.choices?.[0]; if (!choice) return { resolved: false, shape: "choicesMissingFromProviderResponse", body: { error: "Provider response missing required choices array" } };
-    if (!choice) break;
-    messages.push(choice.message);
-    turns = iter; lastStopReason = choice.finish_reason ?? null; lastReasoning = reasoningPresent(choice.message);
-
-    if (choice.finish_reason !== "tool_calls" || !choice.message.tool_calls?.length) {
-      finalText = choice.message.content ?? "";
-      break;
-    }
-
-    const toolResultMessages: OpenAI.Chat.ChatCompletionToolMessageParam[] = [];
-    for (const tc of choice.message.tool_calls) {
-      if (tc.type !== "function") continue;
-      let toolInput: Record<string, unknown>;
-      try { toolInput = JSON.parse(tc.function.arguments); } catch { toolInput = {}; }
-      const start = Date.now();
-      const r = await dispatchTool(dispatchRoute, tc.function.name, withDispatchExecutionId(toolInput, (body as { execution_id?: unknown }).execution_id), offered);
-      toolCalls.push({ iteration: iter, tool_name: tc.function.name, tool_input: toolInput, tool_output: r.ok ? r.result : { error: r.error }, duration_ms: Date.now() - start });
-      toolResultMessages.push({
-        role: "tool",
-        tool_call_id: tc.id,
-        content: toolResultBudget.bound(tc.function.name, toolInput, r),
-      });
-    }
-    messages.push(...toolResultMessages);
-  }
-
-  // Blank final text — an empty last turn, or the iteration cap reached with no final turn — is
-  // an empty completion, not an answer.
-  if (isBlankText(finalText)) {
-    return emptyCompletionRefusal({
-      provider: "openai", model, served_model: rawModel, requested_model: rawModel,
-      stop_reason: lastStopReason, completion_tokens: totalOutputTokens, iterations: turns,
-      reasoning_present: lastReasoning, resolver: VESSEL_ID,
-      execution_id: body.execution_id, dispatch_id: body.dispatch_id,
-    }, { tool_calls: toolCalls, usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens } });
-  }
-
-  return {
-    resolved: true, shape: "llmCompletion", content: finalText,
-    provider: "openai", model,
-    tool_calls: toolCalls,
-    iterations: toolCalls.length > 0 ? toolCalls[toolCalls.length - 1]!.iteration : 0,
-    usage: { input_tokens: totalInputTokens, output_tokens: totalOutputTokens },
-  };
 }
 
 // Every provider call goes through one of these two, so the provider standing that llmQuotaState
