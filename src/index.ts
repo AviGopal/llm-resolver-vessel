@@ -1389,6 +1389,9 @@ const daemon = new VesselDaemon({
   apiKey: API_KEY,
   version: "0.2.0",
   enforceCompositionChain: false,
+  // A completion takes longer than discovery's 10 s default, which cut every LLM call routed through it. 300 s is the
+  // bound: a stuck call still ends, with a reason.
+  resolveTimeoutMs: 300_000,
 });
 
 await daemon.start();
