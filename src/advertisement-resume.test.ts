@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { advertiseQuota, advertisementChange, completionQuota, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
+import { advertiseQuota, advertisementChange, completionQuota, makeLatest, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 
 // A fake clock and timer queue, and a sync built like index.ts's: quota when no lane cools; with none, the next re-sync.
 const world = () => {
@@ -107,5 +107,37 @@ describe("advertisement resume", () => {
     expect(body.indexOf("advertiseQuota(drawable, resyncIn !== null")).toBeGreaterThan(body.indexOf("nextResyncInMs(drawable,"));
     const warm = src.slice(src.indexOf("if (was !== runpodWarm) {"), src.indexOf("if (was !== runpodWarm) {") + 400);
     expect(warm).toContain("void syncCompletionAdvertisement();");
+  });
+
+  test("[MUST-FAIL] two syncs whose reads finish out of order: the newer state is the one that stays (deployment)", async () => {
+    const turn = makeLatest();
+    let advertised = null as string | null;
+    // a sync built like index.ts's: ticket, await a read, stop if no longer latest, then set
+    const sync = async (read: Promise<string>) => {
+      const ticket = turn.begin();
+      const state = await read;
+      if (!turn.isLatest(ticket)) return;
+      advertised = state;
+    };
+    let releaseOld!: (v: string) => void;
+    const old = sync(new Promise<string>((r) => { releaseOld = r; })); // started first, its read finishes last
+    const newer = sync(Promise.resolve("dark"));
+    await newer;
+    releaseOld("advertised");
+    await old;
+    expect(advertised).toBe("dark");
+  });
+
+  test("[MUST-FAIL] index.ts's sync takes a ticket before its read and stops after it when no longer latest", () => {
+    const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+    const body = src.slice(src.indexOf("async function syncCompletionAdvertisement()"), src.indexOf("async function llmQuotaStateHandler"));
+    const ticket = body.indexOf("const ticket = syncTurn.begin();");
+    const read = body.indexOf("await loadPolicy()");
+    const stop = body.indexOf("if (!syncTurn.isLatest(ticket)) return;");
+    const set = body.indexOf("await daemon.setShapes(shapes)");
+    expect(ticket).toBeGreaterThan(0);
+    expect(read).toBeGreaterThan(ticket);
+    expect(stop).toBeGreaterThan(read);
+    expect(set).toBeGreaterThan(stop);
   });
 });

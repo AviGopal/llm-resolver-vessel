@@ -30,7 +30,7 @@
 
 import { coolingRefusal, markedUntil } from "./model-cooldown";
 import { countOutcome } from "./call-outcome";
-import { advertiseQuota, advertisementChange, completionQuota, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
+import { advertiseQuota, advertisementChange, completionQuota, makeLatest, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 import Anthropic from "@anthropic-ai/sdk";
 import { isScaleToZeroCold, isWarmFromHealth } from "./scale-to-zero";
 import OpenAI from "openai";
@@ -263,6 +263,8 @@ const SELF_HOSTED_VLLM_MODELS = [...new Set(SELF_HOSTED_VLLM_PROVIDERS.flatMap((
 const modelClientMap = new Map<string, OpenAI>();
 // Whether llm_completion was last advertised (null before the first sync), so each change is logged once.
 let completionAdvertised: boolean | null = null;
+// Which sync is the latest (advertisement-resume.ts): an older one that finishes its read last does nothing.
+const syncTurn = makeLatest();
 
 async function syncCompletionAdvertisement(): Promise<void> {
   // Quota-gated advertisement (law: a resolver must not advertise a shape it
@@ -286,8 +288,11 @@ async function syncCompletionAdvertisement(): Promise<void> {
   const shapes = ["llmModelPolicy", "llmModelPolicy_write", "llmQuotaState", "llmSpendSummary"];
   // Quota is a drawable arm that is willing (advertisement-resume.ts), read from the same policy and predicate the
   // request path uses; a pinned provider keeps its own check; a policy that cannot be read falls back to the old one.
+  const ticket = syncTurn.begin();
   const drawable = LLM_PINNED_PROVIDER ? hasCompletionQuota()
     : await loadPolicy().then((p) => completionQuota(p.arms.map((a) => a.model), isModelWilling)).catch(() => hasCompletionQuota());
+  // A newer sync started while this one read the policy: its state is the current one, so this one stops here.
+  if (!syncTurn.isLatest(ticket)) return;
   // With no drawable arm, the next re-sync is at the soonest cooldown still running, so a resume that fired while another
   // lane still cooled is followed by another (advertisement-resume.ts).
   const resyncIn = nextResyncInMs(drawable, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()]);

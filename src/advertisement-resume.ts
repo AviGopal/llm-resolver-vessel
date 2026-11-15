@@ -61,3 +61,13 @@ export const completionQuota = (armModels: string[], willing: (model: string) =>
  */
 export const advertiseQuota = (drawable: boolean, cooldownPending: boolean, wider: () => boolean): boolean =>
   drawable || (!cooldownPending && wider());
+
+/**
+ * Latest call wins: each sync takes a ticket when it starts, and after its await goes on only if no newer sync has
+ * started. Two syncs whose reads finish out of order would otherwise leave the older one's state advertised, possibly
+ * dark with nothing scheduled (deployment).
+ */
+export const makeLatest = (): { begin: () => number; isLatest: (ticket: number) => boolean } => {
+  let last = 0;
+  return { begin: () => ++last, isLatest: (ticket: number) => ticket === last };
+};
