@@ -52,3 +52,12 @@ export const advertisementChange = (before: boolean | null, now: boolean, resync
  * instant unserved refusals instead of discovery routing them to a peer). The same set the policy handler falls back to.
  */
 export const completionQuota = (armModels: string[], willing: (model: string) => boolean): boolean => armModels.some(willing);
+
+/**
+ * Whether to advertise: a drawable arm is willing; or none is, no cooldown will end to re-check, and the wider check
+ * (any keyed model) says something could answer. Without that last case an arm unwilling for a reason no cooldown ends
+ * would de-advertise with nothing scheduled, and a dropped shape receives no call to recover it (qa). A call that then
+ * finds nothing to draw is answered unserved, which is the callee's.
+ */
+export const advertiseQuota = (drawable: boolean, cooldownPending: boolean, wider: () => boolean): boolean =>
+  drawable || (!cooldownPending && wider());

@@ -30,7 +30,7 @@
 
 import { coolingRefusal, markedUntil } from "./model-cooldown";
 import { countOutcome } from "./call-outcome";
-import { advertisementChange, completionQuota, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
+import { advertiseQuota, advertisementChange, completionQuota, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 import Anthropic from "@anthropic-ai/sdk";
 import { isScaleToZeroCold, isWarmFromHealth } from "./scale-to-zero";
 import OpenAI from "openai";
@@ -286,12 +286,15 @@ async function syncCompletionAdvertisement(): Promise<void> {
   const shapes = ["llmModelPolicy", "llmModelPolicy_write", "llmQuotaState", "llmSpendSummary"];
   // Quota is a drawable arm that is willing (advertisement-resume.ts), read from the same policy and predicate the
   // request path uses; a pinned provider keeps its own check; a policy that cannot be read falls back to the old one.
-  const quota = LLM_PINNED_PROVIDER ? hasCompletionQuota()
+  const drawable = LLM_PINNED_PROVIDER ? hasCompletionQuota()
     : await loadPolicy().then((p) => completionQuota(p.arms.map((a) => a.model), isModelWilling)).catch(() => hasCompletionQuota());
+  // With no drawable arm, the next re-sync is at the soonest cooldown still running, so a resume that fired while another
+  // lane still cooled is followed by another (advertisement-resume.ts).
+  const resyncIn = nextResyncInMs(drawable, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()]);
+  // An arm unwilling for a reason no cooldown ends (a cold scale-to-zero arm, an arm with no client) schedules nothing,
+  // and a dropped shape receives no call to recover it: then advertise on the old, wider check rather than strand (qa).
+  const quota = advertiseQuota(drawable, resyncIn !== null, () => hasCompletionQuota());
   if (quota) shapes.unshift("llm_completion", "llmCompletion");
-  // With no quota, the next re-sync is at the soonest cooldown still running, so a resume that fired while another lane
-  // still cooled is followed by another (advertisement-resume.ts).
-  const resyncIn = nextResyncInMs(quota, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()]);
   if (resyncIn !== null) scheduleAdvertisementResume(resyncIn);
   const change = advertisementChange(completionAdvertised, quota, resyncIn);
   if (change !== null) console.warn(`[llm-resolver-vessel] ${change}`);
@@ -813,6 +816,8 @@ async function refreshRunpodWarm(): Promise<void> {
   }
   if (was !== runpodWarm) {
     console.log(`[llm-resolver-vessel] runpod-serverless is now ${runpodWarm ? "WARM — arm eligible" : "COLD — arm gated"}`);
+    // Warmth changes what can be drawn without any cooldown to end, so the advertisement is re-synced here (qa).
+    void syncCompletionAdvertisement();
   }
 }
 

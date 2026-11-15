@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { advertisementChange, completionQuota, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
+import { advertiseQuota, advertisementChange, completionQuota, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 
 // A fake clock and timer queue, and a sync built like index.ts's: quota when no lane cools; with none, the next re-sync.
 const world = () => {
@@ -74,7 +74,7 @@ describe("advertisement resume", () => {
   test("[MUST-FAIL] index.ts reschedules from the sync itself when it finds no quota, and logs each change", () => {
     const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
     const body = src.slice(src.indexOf("async function syncCompletionAdvertisement()"), src.indexOf("async function llmQuotaStateHandler"));
-    expect(body).toContain("nextResyncInMs(quota, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()])");
+    expect(body).toContain("nextResyncInMs(drawable, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()])");
     expect(body).toContain("if (resyncIn !== null) scheduleAdvertisementResume(resyncIn);");
     expect(body).toContain("advertisementChange(completionAdvertised, quota, resyncIn)");
   });
@@ -92,5 +92,20 @@ describe("advertisement resume", () => {
     const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
     const body = src.slice(src.indexOf("async function syncCompletionAdvertisement()"), src.indexOf("async function llmQuotaStateHandler"));
     expect(body).toContain("completionQuota(p.arms.map((a) => a.model), isModelWilling)");
+  });
+
+  test("[MUST-FAIL] no drawable arm and no cooldown pending: still advertised on the wider check, never stranded (qa)", () => {
+    expect(advertiseQuota(false, false, () => true)).toBe(true); // e.g. every arm cold, nothing to expire
+    expect(advertiseQuota(false, true, () => true)).toBe(false); // a cooldown will end: de-advertise and re-check then
+    expect(advertiseQuota(false, false, () => false)).toBe(false); // nothing keyed at all
+    expect(advertiseQuota(true, true, () => false)).toBe(true);
+  });
+
+  test("[MUST-FAIL] the sync decides with advertiseQuota after the resync is known, and a warmth change re-syncs", () => {
+    const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+    const body = src.slice(src.indexOf("async function syncCompletionAdvertisement()"), src.indexOf("async function llmQuotaStateHandler"));
+    expect(body.indexOf("advertiseQuota(drawable, resyncIn !== null")).toBeGreaterThan(body.indexOf("nextResyncInMs(drawable,"));
+    const warm = src.slice(src.indexOf("if (was !== runpodWarm) {"), src.indexOf("if (was !== runpodWarm) {") + 400);
+    expect(warm).toContain("void syncCompletionAdvertisement();");
   });
 });
