@@ -65,6 +65,8 @@ describe("advertisement resume", () => {
   test("[MUST-FAIL] both directions are logged, once per change", () => {
     expect(advertisementChange(true, false, 5000)).toContain("de-advertising llm_completion until quota returns; re-checking in 5s");
     expect(advertisementChange(false, true, null)).toBe("quota returned — advertising llm_completion");
+    // A start is not a resume: null → true says so (research).
+    expect(advertisementChange(null, true, null)).toBe("advertising llm_completion at start");
     expect(advertisementChange(true, true, null)).toBeNull();
     expect(advertisementChange(false, false, 5000)).toBeNull();
   });

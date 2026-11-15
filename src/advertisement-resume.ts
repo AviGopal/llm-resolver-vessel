@@ -41,6 +41,6 @@ export const makeResumeScheduler = (d: ResumeDeps): ((ms: number) => void) => {
 export const advertisementChange = (before: boolean | null, now: boolean, resyncInMs: number | null): string | null => {
   if (before === now) return null;
   return now
-    ? "quota returned — advertising llm_completion"
+    ? before === null ? "advertising llm_completion at start" : "quota returned — advertising llm_completion"
     : `all completion providers cooling — de-advertising llm_completion until quota returns${resyncInMs === null ? " (no cooldown pending: nothing will bring it back but a recovery or a restart)" : `; re-checking in ${Math.round(resyncInMs / 1000)}s`}`;
 };

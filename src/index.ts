@@ -28,6 +28,7 @@
  *       Any other OpenAI-compatible endpoint
  */
 
+import { coolingRefusal, markedUntil } from "./model-cooldown";
 import { countOutcome } from "./call-outcome";
 import { advertisementChange, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 import Anthropic from "@anthropic-ai/sdk";
@@ -896,7 +897,10 @@ const scheduleAdvertisementResume = makeResumeScheduler({
   sync: () => void syncCompletionAdvertisement(),
 });
 const markModelExhausted = (m: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
-  modelExhaustedUntil.set(m, Date.now() + ms);
+  // A mark while the model still cools leaves its expiry as it is (model-cooldown.ts): no slide, no repeat log.
+  const { until, changed } = markedUntil(modelExhaustedUntil.get(m), Date.now(), ms);
+  if (!changed) return;
+  modelExhaustedUntil.set(m, until);
   console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(ms / 1000)}s`);
   void syncCompletionAdvertisement();
   scheduleAdvertisementResume(ms);
@@ -957,7 +961,8 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   if (wireClient) {
     if (inModelCooldown(model)) {
       const walked = await walkFallbackModels(body, model, empties);
-      if (walked) return walked;
+      // A cooled model is never called (model-cooldown.ts): with no fallback serving, it is unserved now.
+      return walked ?? coolingRefusal(model, modelExhaustedUntil.get(model) ?? Date.now());
     }
     const r = await resolveWithOpenAI(body, wireClient);
     if (isEmptyCompletion(r)) {
@@ -971,6 +976,10 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   }
   // Any vendor/model id not explicitly mapped routes through OpenRouter when keyed.
   if (openrouterClient && model.includes("/") && !model.toLowerCase().startsWith("anthropic/")) {
+    if (inModelCooldown(model)) {
+      const walked = await walkFallbackModels(body, model, empties);
+      return walked ?? coolingRefusal(model, modelExhaustedUntil.get(model) ?? Date.now());
+    }
     const r = await resolveWithOpenAI(body, openrouterClient);
     if (isEmptyCompletion(r)) {
       empties.push(...emptyArmsOf(r));
