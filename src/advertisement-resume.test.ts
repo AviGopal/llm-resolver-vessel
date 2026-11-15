@@ -29,8 +29,10 @@ const world = () => {
     advertised = quota;
   };
   const mark = (lane: string, ms: number): void => { until.set(lane, t + ms); sync(); schedule(ms); };
+  // Bounded: a regression that re-arms a timer for a moment already past must fail here, not stall the suite (qa).
   const runUntil = (end: number): void => {
-    for (;;) {
+    for (let fired = 0; ; fired++) {
+      if (fired > 1000) throw new Error("more than 1000 timers fired: a re-sync keeps re-arming for a moment already past");
       const due = timers.filter((h) => !h.dead && h.at <= end).sort((a, b) => a.at - b.at)[0];
       if (due === undefined) break;
       due.dead = true; t = due.at; due.fn();
