@@ -28,6 +28,7 @@
  *       Any other OpenAI-compatible endpoint
  */
 
+import { countOutcome } from "./call-outcome";
 import { advertisementChange, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 import Anthropic from "@anthropic-ai/sdk";
 import { isScaleToZeroCold, isWarmFromHealth } from "./scale-to-zero";
@@ -1223,7 +1224,7 @@ const executor = new ActivityExecutor(runtime);
 const SPEND_WINDOW_MS = 3600_000;
 interface SpendTotals { calls: number; input_tokens: number; output_tokens: number; cost_usd: number }
 interface SpendKeyTotals extends SpendTotals { model: string; provider: string; task_type: string; caller: string }
-interface SpendWindow extends SpendTotals { window_start: string; by_key: Record<string, SpendKeyTotals> }
+interface SpendWindow extends SpendTotals { window_start: string; by_key: Record<string, SpendKeyTotals>; outcomes?: Record<string, number> }
 const newSpendWindow = (atMs: number): SpendWindow => ({ window_start: new Date(atMs).toISOString(), calls: 0, input_tokens: 0, output_tokens: 0, cost_usd: 0, by_key: {} });
 let spendWindowStartMs = Date.now();
 let spendCurrent = newSpendWindow(spendWindowStartMs);
@@ -1234,6 +1235,8 @@ function rollSpendWindow(nowMs: number): void {
   if (nowMs - spendWindowStartMs < SPEND_WINDOW_MS) return;
   const w = spendCurrent;
   console.log(`[llm-spend] window ${w.window_start} calls=${w.calls} tokens_in=${w.input_tokens} tokens_out=${w.output_tokens} cost_usd=${w.cost_usd.toFixed(6)}`);
+  // Every call's outcome by producer (call-outcome.ts), so a window shows what answered, not only what was spent.
+  console.log(`[llm-outcomes] window ${w.window_start} ${Object.entries(w.outcomes ?? {}).map(([k, n]) => `${k}=${n}`).join(" ") || "none"}`);
   spendPrevious = w;
   spendWindowStartMs = nowMs - ((nowMs - spendWindowStartMs) % SPEND_WINDOW_MS);
   spendCurrent = newSpendWindow(spendWindowStartMs);
@@ -1313,6 +1316,8 @@ const llmCompletionMeteredHandler: ResolverHandler = async (ctx) => {
     if (over) return dispatchBudgetRefusal(ceilingBody, typeof ceilingBody.model === "string" && ceilingBody.model.length > 0 ? ceilingBody.model : "auto", over);
   }
   const result = await llmCompletionWithPolicyHandler(ctx);
+  rollSpendWindow(Date.now());
+  for (const w of [spendCurrent, spendSinceStart]) countOutcome(w.outcomes ??= {}, result, (ctx.body as LlmCompletionRequest | undefined)?.model);
   try {
     const r = result as Record<string, unknown>;
     const usage = r.usage as { input_tokens?: number; output_tokens?: number; cost_usd?: number } | undefined;
