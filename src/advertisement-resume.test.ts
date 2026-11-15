@@ -1,0 +1,77 @@
+// A DE-ADVERTISED COMPLETION PLANE COMES BACK WHEN ITS LAST COOLDOWN ENDS (advertisement-resume.ts).
+// FALSIFIER (research): two overlapping cooldowns, the earlier expiring first. The resume that fires at the first
+// expiry finds the second still cooling; it must schedule another, and the plane is advertised once the later ends.
+// CONTROL: with nothing cooling, nothing is scheduled. index.ts's wiring is pinned by source (the sync is not exported).
+import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { advertisementChange, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
+
+// A fake clock and timer queue, and a sync built like index.ts's: quota when no lane cools; with none, the next re-sync.
+const world = () => {
+  let t = 0;
+  const timers: Array<{ at: number; fn: () => void; dead: boolean }> = [];
+  const until = new Map<string, number>();
+  const log: string[] = [];
+  let advertised: boolean | null = null;
+  const schedule = makeResumeScheduler({
+    now: () => t,
+    setTimer: (fn, ms) => { const h = { at: t + ms, fn, dead: false }; timers.push(h); return h; },
+    clearTimer: (h) => { (h as { dead: boolean }).dead = true; },
+    sync: () => sync(),
+  });
+  const sync = (): void => {
+    const quota = [...until.values()].every((u) => u <= t);
+    const next = nextResyncInMs(quota, t, until.values());
+    if (next !== null) schedule(next);
+    const line = advertisementChange(advertised, quota, next);
+    if (line !== null) log.push(`${t}: ${line}`);
+    advertised = quota;
+  };
+  const mark = (lane: string, ms: number): void => { until.set(lane, t + ms); sync(); schedule(ms); };
+  const runUntil = (end: number): void => {
+    for (;;) {
+      const due = timers.filter((h) => !h.dead && h.at <= end).sort((a, b) => a.at - b.at)[0];
+      if (due === undefined) break;
+      due.dead = true; t = due.at; due.fn();
+    }
+    t = end;
+  };
+  return { mark, runUntil, advertised: () => advertised, log, sync, at: (x: number) => { t = x; } };
+};
+
+describe("advertisement resume", () => {
+  test("[MUST-FAIL] two overlapping cooldowns: re-advertised when the LATER one ends, not left dark (research)", () => {
+    const w = world();
+    w.sync(); // boot: advertised
+    w.mark("model-a", 600_000); // t=0, cools until 600 s
+    w.at(60_000);
+    w.mark("model-b", 600_000); // t=60 s, cools until 660 s
+    w.runUntil(630_000); // the first resume fired at ~601 s and found b still cooling
+    expect(w.advertised()).toBe(false);
+    w.runUntil(700_000);
+    expect(w.advertised()).toBe(true);
+    expect(w.log.at(-1)).toContain("advertising llm_completion");
+  });
+
+  test("the next re-sync is the soonest expiry still ahead; none when quota is back or nothing cools", () => {
+    expect(nextResyncInMs(false, 100, [50, 300, 200])).toBe(100);
+    expect(nextResyncInMs(true, 100, [300])).toBeNull();
+    expect(nextResyncInMs(false, 100, [50])).toBeNull();
+  });
+
+  test("[MUST-FAIL] both directions are logged, once per change", () => {
+    expect(advertisementChange(true, false, 5000)).toContain("de-advertising llm_completion until quota returns; re-checking in 5s");
+    expect(advertisementChange(false, true, null)).toBe("quota returned — advertising llm_completion");
+    expect(advertisementChange(true, true, null)).toBeNull();
+    expect(advertisementChange(false, false, 5000)).toBeNull();
+  });
+
+  test("[MUST-FAIL] index.ts reschedules from the sync itself when it finds no quota, and logs each change", () => {
+    const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+    const body = src.slice(src.indexOf("async function syncCompletionAdvertisement()"), src.indexOf("async function llmQuotaStateHandler"));
+    expect(body).toContain("nextResyncInMs(quota, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()])");
+    expect(body).toContain("if (resyncIn !== null) scheduleAdvertisementResume(resyncIn);");
+    expect(body).toContain("advertisementChange(completionAdvertised, quota, resyncIn)");
+  });
+});

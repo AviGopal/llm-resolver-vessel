@@ -28,6 +28,7 @@
  *       Any other OpenAI-compatible endpoint
  */
 
+import { advertisementChange, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 import Anthropic from "@anthropic-ai/sdk";
 import { isScaleToZeroCold, isWarmFromHealth } from "./scale-to-zero";
 import OpenAI from "openai";
@@ -258,6 +259,8 @@ for (const p of SELF_HOSTED_VLLM_PROVIDERS) {
 const SELF_HOSTED_VLLM_MODELS = [...new Set(SELF_HOSTED_VLLM_PROVIDERS.flatMap((p) => p.models))];
 
 const modelClientMap = new Map<string, OpenAI>();
+// Whether llm_completion was last advertised (null before the first sync), so each change is logged once.
+let completionAdvertised: boolean | null = null;
 
 async function syncCompletionAdvertisement(): Promise<void> {
   // Quota-gated advertisement (law: a resolver must not advertise a shape it
@@ -279,11 +282,15 @@ async function syncCompletionAdvertisement(): Promise<void> {
   // scheduleAdvertisementResume(), and a recovering provider re-syncs on the
   // success path (clearExhausted).
   const shapes = ["llmModelPolicy", "llmModelPolicy_write", "llmQuotaState", "llmSpendSummary"];
-  if (hasCompletionQuota()) {
-    shapes.unshift("llm_completion", "llmCompletion");
-  } else {
-    console.warn("[llm-resolver-vessel] all completion providers cooling — de-advertising llm_completion until quota returns");
-  }
+  const quota = hasCompletionQuota();
+  if (quota) shapes.unshift("llm_completion", "llmCompletion");
+  // With no quota, the next re-sync is at the soonest cooldown still running, so a resume that fired while another lane
+  // still cooled is followed by another (advertisement-resume.ts).
+  const resyncIn = nextResyncInMs(quota, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()]);
+  if (resyncIn !== null) scheduleAdvertisementResume(resyncIn);
+  const change = advertisementChange(completionAdvertised, quota, resyncIn);
+  if (change !== null) console.warn(`[llm-resolver-vessel] ${change}`);
+  completionAdvertised = quota;
   try {
     await daemon.setShapes(shapes);
   } catch (err) {
@@ -875,22 +882,18 @@ const hasCompletionQuota = (): boolean => {
 // receives no traffic, so nothing would ever clear a passively-expiring model
 // cooldown — re-run the advertisement sync once the exhaustion window lapses.
 // One pending timer at a time; unref so it never holds the process open.
-let advertisementResumeTimer: ReturnType<typeof setTimeout> | null = null;
-let advertisementResumeAt = 0;
-const scheduleAdvertisementResume = (ms: number = EXHAUSTION_COOLDOWN_MS): void => {
-  const fireAt = Date.now() + ms + 1000;
-  // Keep the soonest pending resume: a short reachability cooldown must not be
-  // shadowed by an earlier-scheduled long exhaustion window (else a recovered
-  // spot endpoint stays de-advertised for the full 10 minutes).
-  if (advertisementResumeTimer !== null && fireAt >= advertisementResumeAt) return;
-  if (advertisementResumeTimer !== null) clearTimeout(advertisementResumeTimer);
-  advertisementResumeAt = fireAt;
-  advertisementResumeTimer = setTimeout(() => {
-    advertisementResumeTimer = null;
-    void syncCompletionAdvertisement();
-  }, ms + 1000);
-  (advertisementResumeTimer as { unref?: () => void }).unref?.();
-};
+// Keep the soonest pending resume: a short reachability cooldown must not be shadowed by an earlier-scheduled long
+// exhaustion window (else a recovered spot endpoint stays de-advertised for the full 10 minutes).
+const scheduleAdvertisementResume = makeResumeScheduler({
+  now: () => Date.now(),
+  setTimer: (fn, ms) => {
+    const t = setTimeout(fn, ms);
+    (t as { unref?: () => void }).unref?.();
+    return t;
+  },
+  clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
+  sync: () => void syncCompletionAdvertisement(),
+});
 const markModelExhausted = (m: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
   modelExhaustedUntil.set(m, Date.now() + ms);
   console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(ms / 1000)}s`);
