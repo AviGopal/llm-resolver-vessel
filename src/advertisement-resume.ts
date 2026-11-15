@@ -44,3 +44,11 @@ export const advertisementChange = (before: boolean | null, now: boolean, resync
     ? before === null ? "advertising llm_completion at start" : "quota returned — advertising llm_completion"
     : `all completion providers cooling — de-advertising llm_completion until quota returns${resyncInMs === null ? " (no cooldown pending: nothing will bring it back but a recovery or a restart)" : `; re-checking in ${Math.round(resyncInMs / 1000)}s`}`;
 };
+
+/**
+ * Whether llm_completion can be served: some arm the request path can draw (the policy's arms) is willing now. Not "any
+ * keyed model": the client map holds every model a provider is keyed for, and a model nothing draws is never called,
+ * never cooled, and so kept the shape advertised while every drawn arm was cooling (live: 22:52-23:00, callers got
+ * instant unserved refusals instead of discovery routing them to a peer). The same set the policy handler falls back to.
+ */
+export const completionQuota = (armModels: string[], willing: (model: string) => boolean): boolean => armModels.some(willing);

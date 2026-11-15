@@ -30,7 +30,7 @@
 
 import { coolingRefusal, markedUntil } from "./model-cooldown";
 import { countOutcome } from "./call-outcome";
-import { advertisementChange, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
+import { advertisementChange, completionQuota, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 import Anthropic from "@anthropic-ai/sdk";
 import { isScaleToZeroCold, isWarmFromHealth } from "./scale-to-zero";
 import OpenAI from "openai";
@@ -284,7 +284,10 @@ async function syncCompletionAdvertisement(): Promise<void> {
   // scheduleAdvertisementResume(), and a recovering provider re-syncs on the
   // success path (clearExhausted).
   const shapes = ["llmModelPolicy", "llmModelPolicy_write", "llmQuotaState", "llmSpendSummary"];
-  const quota = hasCompletionQuota();
+  // Quota is a drawable arm that is willing (advertisement-resume.ts), read from the same policy and predicate the
+  // request path uses; a pinned provider keeps its own check; a policy that cannot be read falls back to the old one.
+  const quota = LLM_PINNED_PROVIDER ? hasCompletionQuota()
+    : await loadPolicy().then((p) => completionQuota(p.arms.map((a) => a.model), isModelWilling)).catch(() => hasCompletionQuota());
   if (quota) shapes.unshift("llm_completion", "llmCompletion");
   // With no quota, the next re-sync is at the soonest cooldown still running, so a resume that fired while another lane
   // still cooled is followed by another (advertisement-resume.ts).

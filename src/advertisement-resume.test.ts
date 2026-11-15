@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { advertisementChange, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
+import { advertisementChange, completionQuota, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
 
 // A fake clock and timer queue, and a sync built like index.ts's: quota when no lane cools; with none, the next re-sync.
 const world = () => {
@@ -77,5 +77,20 @@ describe("advertisement resume", () => {
     expect(body).toContain("nextResyncInMs(quota, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()])");
     expect(body).toContain("if (resyncIn !== null) scheduleAdvertisementResume(resyncIn);");
     expect(body).toContain("advertisementChange(completionAdvertised, quota, resyncIn)");
+  });
+
+  test("[MUST-FAIL] every drawable arm cooling means no quota, whatever other keyed models are idle (research)", () => {
+    const cooling = new Set(["arm/a", "arm/b"]);
+    const willing = (m: string) => !cooling.has(m);
+    // "keyed/idle" is in the client map but no arm: nothing draws it, so it never cools and must not count
+    expect(completionQuota(["arm/a", "arm/b"], willing)).toBe(false);
+    expect(completionQuota(["arm/a", "arm/c"], willing)).toBe(true);
+    expect(completionQuota([], willing)).toBe(false);
+  });
+
+  test("[MUST-FAIL] the sync reads quota from the policy's arms and the willingness predicate, not from the client map", () => {
+    const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
+    const body = src.slice(src.indexOf("async function syncCompletionAdvertisement()"), src.indexOf("async function llmQuotaStateHandler"));
+    expect(body).toContain("completionQuota(p.arms.map((a) => a.model), isModelWilling)");
   });
 });
