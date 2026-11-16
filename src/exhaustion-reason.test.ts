@@ -78,6 +78,16 @@ describe("the exhaustion marks", () => {
     expect(c.exhaustionWhys[1]).toBe("provider answered 402 402: 402 Insufficient credits");
   });
 
+  test("[MUST-FAIL] an unmapped vendor/model id through openrouter: its mark carries openrouter's 402 (qa; node1's paid path)", async () => {
+    const OR = "vendor/unmapped-paid";
+    const c = completionChain({ openrouter: [apiError(402, "402 This request requires more credits", { code: 402 })], models: [] });
+    const r = await c.fns.llmCompletionHandler({ body: { ...body, model: OR } });
+    expect(r.resolved).toBe(false);
+    expect(c.calls).toEqual(["openrouter"]);
+    expect(c.exhaustionMarks).toEqual([OR]);
+    expect(c.exhaustionWhys).toEqual(["provider answered 402 402: 402 This request requires more credits"]);
+  });
+
   test("[MUST-FAIL] the anthropic catch puts the provider's answer on the result (qa)", async () => {
     const fns = loadIndexDeclarations(["resolveWithAnthropicUnobserved"], {
       reasonOf, reasonText,

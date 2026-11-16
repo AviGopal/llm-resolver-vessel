@@ -29,6 +29,8 @@ export interface ChainOptions {
   cooling?: string[];
   /** The owner's denied_models entries in force (none by default). */
   denied?: string[];
+  /** The catch-all lane: openrouterClient answers these turns, for a vendor/model id no map names. */
+  openrouter?: Array<unknown>;
   /** A primary lane: pickProvider answers "openai", and openaiClient answers these turns (an Error is thrown). */
   openai?: Array<unknown>;
   /** Replaces the real llmCompletionHandler (to hand the policy handler a fixed result). */
@@ -82,6 +84,16 @@ export function completionChain(opts: ChainOptions): Chain {
       return structuredClone(t);
     } } },
   };
+  let q = 0;
+  const openrouterClient = opts.openrouter === undefined ? null : {
+    baseURL: "https://openrouter.test",
+    chat: { completions: { create: async () => {
+      calls.push("openrouter");
+      const t = opts.openrouter![Math.min(q++, opts.openrouter!.length - 1)];
+      if (t instanceof Error) throw t;
+      return structuredClone(t);
+    } } },
+  };
   const standing = {
     providerOf: () => "wire",
     admit: () => true,
@@ -95,7 +107,7 @@ export function completionChain(opts: ChainOptions): Chain {
     VESSEL_ID: "llm-resolver-vessel-test",
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_MAX_TOKENS: 4096,
-    openaiClient, openrouterClient: null, anthropic: null,
+    openaiClient, openrouterClient, anthropic: null,
     modelClientMap,
     providerStanding: standing,
     inModelCooldown: (m: string) => cooling.has(m),
