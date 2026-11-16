@@ -6,6 +6,8 @@
 import { describe, expect, test } from "bun:test";
 import { completionChain, textTurn } from "./completion-chain-harness";
 import { deniedBy } from "./model-policy";
+import { completionQuota } from "./advertisement-resume";
+import { loadIndexDeclarations } from "./index-fn-harness";
 
 const PAID = "vendor/paid-model", PAID2 = "vendor/paid-two", FREE = "vendor/some-model:free";
 const ask = (more: Record<string, unknown>) => ({ type: "llm_completion", prompt: "p", task_type: "grading", ...more });
@@ -43,5 +45,26 @@ describe("denied models", () => {
     const r2 = await none.fns.llmCompletionHandler({ body: ask({ model: FREE }) });
     expect(none.calls).toEqual([]);
     expect(r2).toMatchObject({ resolved: false, unserved: "llm_completion", requested_model: FREE });
+  });
+
+  // index.ts's own isModelWilling, lifted with a keyed client for each model, the given ones cooling, the given entries denied.
+  const willingness = (models: string[], cooling: string[], denied: string[]) => {
+    const client = { baseURL: "https://provider.test/v1" };
+    const modelClientMap = new Map<string, unknown>(models.map((m) => [m, client]));
+    const fns = loadIndexDeclarations(["isModelWilling"], {
+      modelClientMap, openrouterClient: null, anthropic: null, OPENROUTER_MODEL_SET: new Set<string>(),
+      isRunpodCold: () => false, inModelCooldown: (m: string) => cooling.includes(m), inCooldown: () => false,
+      providerKeyOf: (c: { baseURL?: string }) => String(c.baseURL),
+      isDenied: (m: string) => denied.some((d) => d !== "" && m.includes(d)),
+    });
+    return fns.isModelWilling as (m: string) => boolean;
+  };
+
+  test("[MUST-FAIL] every permitted arm cooled and a denied arm otherwise willing: not willing, so no quota and no draw (qa)", () => {
+    const willing = willingness([PAID, FREE], [PAID], DENY);
+    expect(willing(FREE)).toBe(false);
+    expect(completionQuota([PAID, FREE], willing)).toBe(false); // de-advertised, so discovery routes to a peer
+    // control: with no denial, the same free arm keeps the node advertised
+    expect(completionQuota([PAID, FREE], willingness([PAID, FREE], [PAID], []))).toBe(true);
   });
 });
