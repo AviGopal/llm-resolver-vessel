@@ -53,6 +53,8 @@ export function completionChain(opts: ChainOptions): Chain {
   const exhaustionMarks: string[] = [];
   const exhaustionWhys: string[] = [];
   const cooling = new Set(opts.cooling ?? []);
+  // Provider lanes a mark has cooled (markExhausted): a later call finds its primary cooling, as index.ts's would.
+  const coolingKeys = new Set<string>();
   const modelClientMap = new Map<string, unknown>();
   for (const [model, turns] of opts.models) {
     let i = 0;
@@ -98,9 +100,9 @@ export function completionChain(opts: ChainOptions): Chain {
     providerStanding: standing,
     inModelCooldown: (m: string) => cooling.has(m),
     isDenied: (m: string) => (opts.denied ?? []).some((d) => d !== "" && m.includes(d)),
-    inCooldown: () => false,
+    inCooldown: (k: string) => coolingKeys.has(k),
     markModelExhausted: (m: string, why: string) => { exhaustionMarks.push(m); exhaustionWhys.push(why); cooling.add(m); },
-    markExhausted: (k: string, why: string) => { exhaustionMarks.push(k); exhaustionWhys.push(why); },
+    markExhausted: (k: string, why: string) => { exhaustionMarks.push(k); exhaustionWhys.push(why); coolingKeys.add(k); },
     modelCooldownMsFor: () => 600_000,
     cooldownMsFor: () => 600_000,
     clearModelEscalation: () => {}, clearExhausted: () => {},

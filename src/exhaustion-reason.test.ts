@@ -66,6 +66,18 @@ describe("the exhaustion marks", () => {
     expect(c.exhaustionWhys[0]).toBe("provider answered 429 rate_limit_exceeded: 429 Rate limit reached");
   });
 
+  test("[MUST-FAIL] the primary lane's RETRY mark carries the retry's own answer, not the cooled first result's (qa)", async () => {
+    // first call: the primary answers 429 and its lane cools; second call: the lane is cooling, nothing else serves, so
+    // the primary is tried anyway and answers 402. That mark's why is the 402.
+    const c = completionChain({ openai: [apiError(429, "429 Rate limit reached", { code: "rate_limit_exceeded" }),
+      apiError(402, "402 Insufficient credits", { code: 402 })], models: [] });
+    await c.fns.llmCompletionHandler({ body: { ...body, model: "primary-model" } });
+    const r = await c.fns.llmCompletionHandler({ body: { ...body, model: "primary-model" } });
+    expect(r.resolved).toBe(false);
+    expect(c.exhaustionMarks).toEqual(["openai", "openai"]);
+    expect(c.exhaustionWhys[1]).toBe("provider answered 402 402: 402 Insufficient credits");
+  });
+
   test("[MUST-FAIL] the anthropic catch puts the provider's answer on the result (qa)", async () => {
     const fns = loadIndexDeclarations(["resolveWithAnthropicUnobserved"], {
       reasonOf, reasonText,
