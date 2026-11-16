@@ -24,6 +24,12 @@ describe("the provider's answer, as a reason", () => {
     expect(r).toContain("[redacted]");
   });
 
+  test("[MUST-FAIL] a credential-shaped provider error code is redacted too (qa)", () => {
+    const r = reasonText(reasonOf(apiError(401, "401 rejected", { code: "sk-" + "or-v1-FAKEcode" })));
+    expect(r).not.toContain("FAKEcode");
+    expect(r).toBe("provider answered 401 [redacted]: 401 rejected");
+  });
+
   test("a result with no provider answer says so", () => {
     expect(reasonText(undefined)).toBe("no provider answer recorded");
     expect(reasonText({ status: 500 })).toBe("no provider answer recorded");
@@ -37,6 +43,43 @@ describe("the exhaustion marks", () => {
     expect(r.resolved).toBe(true);
     expect(c.exhaustionMarks).toEqual([X]);
     expect(c.exhaustionWhys).toEqual(["provider answered 402 402: 402 Insufficient credits"]);
+  });
+
+  test("[MUST-FAIL] a FALLBACK model's mark carries that model's own answer, not the drawn one's (qa)", async () => {
+    const Z = "z/paid-arm";
+    const c = completionChain({ models: [
+      [X, [apiError(402, "402 Insufficient credits", { code: 402 })]],
+      [Y, [apiError(403, "403 Key limit exceeded", { code: "limit_exceeded" })]],
+      [Z, [textTurn("served by z")]],
+    ] });
+    const r = await c.fns.llmCompletionHandler({ body: { ...body, model: X } });
+    expect(r.resolved).toBe(true);
+    expect(c.exhaustionMarks).toEqual([X, Y]);
+    expect(c.exhaustionWhys[1]).toBe("provider answered 403 limit_exceeded: 403 Key limit exceeded");
+  });
+
+  test("[MUST-FAIL] the PRIMARY lane's provider mark carries the provider's answer (qa)", async () => {
+    const c = completionChain({ openai: [apiError(429, "429 Rate limit reached", { code: "rate_limit_exceeded" })], models: [[Y, [textTurn("served by y")]]] });
+    const r = await c.fns.llmCompletionHandler({ body: { ...body, model: "primary-model" } });
+    expect(r.resolved).toBe(true);
+    expect(c.exhaustionMarks[0]).toBe("openai");
+    expect(c.exhaustionWhys[0]).toBe("provider answered 429 rate_limit_exceeded: 429 Rate limit reached");
+  });
+
+  test("[MUST-FAIL] the anthropic catch puts the provider's answer on the result (qa)", async () => {
+    const fns = loadIndexDeclarations(["resolveWithAnthropicUnobserved"], {
+      reasonOf, reasonText,
+      console: { log() {}, warn() {}, error() {} },
+      anthropic: { messages: { create: async () => { throw apiError(429, "429 Rate limited", { error: { type: "rate_limit_error" } }); } } },
+      RETIRED_ANTHROPIC_MODEL_IDS: new Set(), DEFAULT_MODEL: "claude-test", DEFAULT_MAX_TOKENS: 64,
+      budgetedProviderCall: async (o: { call: () => Promise<unknown> }) => ({ response: await o.call() }),
+      dispatchLedger: {}, dispatchKeyOf: () => "d", estimateInputTokens: () => 1, readMaxInputTokensPerDispatch: async () => null,
+      cachedSystem: () => ({}), anthropicCreditFallback: async () => null, anthropicInputTokens: () => 1,
+    });
+    const r = await fns.resolveWithAnthropicUnobserved({ prompt: "p", model: "claude-test" });
+    // (a provider code of 20 or more characters, such as invalid_request_error, reads [redacted]: the shared redaction's
+    // length rule; the message still says the cause)
+    expect(r.provider_reason).toEqual({ status: 429, code: "rate_limit_error", message: "429 Rate limited" });
   });
 
   test("[MUST-FAIL] the model mark's log line says why (the shipped markModelExhausted)", () => {

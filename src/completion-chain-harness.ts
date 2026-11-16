@@ -29,6 +29,8 @@ export interface ChainOptions {
   cooling?: string[];
   /** The owner's denied_models entries in force (none by default). */
   denied?: string[];
+  /** A primary lane: pickProvider answers "openai", and openaiClient answers these turns (an Error is thrown). */
+  openai?: Array<unknown>;
   /** Replaces the real llmCompletionHandler (to hand the policy handler a fixed result). */
   completionHandler?: (ctx: { body: Record<string, unknown> }) => Promise<Record<string, unknown>>;
 }
@@ -68,6 +70,16 @@ export function completionChain(opts: ChainOptions): Chain {
       },
     });
   }
+  let o = 0;
+  const openaiClient = opts.openai === undefined ? null : {
+    baseURL: "https://primary.test",
+    chat: { completions: { create: async () => {
+      calls.push("openai");
+      const t = opts.openai![Math.min(o++, opts.openai!.length - 1)];
+      if (t instanceof Error) throw t;
+      return structuredClone(t);
+    } } },
+  };
   const standing = {
     providerOf: () => "wire",
     admit: () => true,
@@ -81,7 +93,7 @@ export function completionChain(opts: ChainOptions): Chain {
     VESSEL_ID: "llm-resolver-vessel-test",
     DEFAULT_MODEL: "claude-sonnet-5",
     DEFAULT_MAX_TOKENS: 4096,
-    openaiClient: null, openrouterClient: null, anthropic: null,
+    openaiClient, openrouterClient: null, anthropic: null,
     modelClientMap,
     providerStanding: standing,
     inModelCooldown: (m: string) => cooling.has(m),
@@ -90,10 +102,11 @@ export function completionChain(opts: ChainOptions): Chain {
     markModelExhausted: (m: string, why: string) => { exhaustionMarks.push(m); exhaustionWhys.push(why); cooling.add(m); },
     markExhausted: (k: string, why: string) => { exhaustionMarks.push(k); exhaustionWhys.push(why); },
     modelCooldownMsFor: () => 600_000,
+    cooldownMsFor: () => 600_000,
     clearModelEscalation: () => {}, clearExhausted: () => {},
     providerKeyOf: (c: { baseURL?: string }) => String(c.baseURL),
     wireProviderIdOf: () => "wire",
-    pickProvider: () => null,
+    pickProvider: () => (openaiClient ? "openai" : null),
     readGateParams: async () => ({}),
     readFallbackOrder: async () => undefined,
     readMaxInputTokens: async () => 1_000_000,
