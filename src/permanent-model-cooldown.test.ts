@@ -177,12 +177,14 @@ function calls(root: ts.Node, name: string): ts.CallExpression[] {
 }
 
 describe("MUST-FAIL: index.ts sizes every model cooldown per model and resets on a served call", () => {
-  test("every markModelExhausted(X, …) call sizes its window with modelCooldownMsFor(X, …)", () => {
+  test("every markModelExhausted(X, why, …) call sizes its window with modelCooldownMsFor(X, …) and says the result's reason", () => {
     const sf = indexSource();
     const marks = calls(sf, "markModelExhausted");
     expect(marks.length).toBeGreaterThanOrEqual(3);
     for (const c of marks) {
-      const sized = c.arguments[1];
+      // why: the provider's answer on the result that failed (exhaustion-reason.ts)
+      expect(c.arguments[1]?.getText().startsWith("reasonText("), c.getText()).toBe(true);
+      const sized = c.arguments[2];
       expect(sized !== undefined && ts.isCallExpression(sized), c.getText()).toBe(true);
       const sc = sized as ts.CallExpression;
       expect(sc.expression.getText(), c.getText()).toBe("modelCooldownMsFor");

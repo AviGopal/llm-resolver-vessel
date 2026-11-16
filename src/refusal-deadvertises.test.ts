@@ -53,13 +53,13 @@ describe('a last-resort refusal de-advertises the completion shapes', () => {
     const b = refusalBlock();
     // Lanes, not models: the refusal is a statement about lanes, and clause 2/3 of
     // hasCompletionQuota() are lane-keyed. Cooling models alone cannot close the gate.
-    expect(b).toMatch(/markExhausted\("anthropic"\)/);
-    expect(b).toMatch(/markExhausted\("openai"\)/);
+    expect(b).toMatch(/markExhausted\("anthropic"[,)]/);
+    expect(b).toMatch(/markExhausted\("openai"[,)]/);
   });
 
   it('the marking happens BEFORE the error returns', () => {
     const b = refusalBlock();
-    const mark = b.indexOf('markExhausted("anthropic")');
+    const mark = b.indexOf('markExhausted("anthropic",');
     const ret = b.indexOf('return { resolved: false');
     expect(mark).toBeGreaterThan(-1);
     expect(ret).toBeGreaterThan(mark);
@@ -70,7 +70,7 @@ describe('a last-resort refusal de-advertises the completion shapes', () => {
     // cool a lane without dropping the shape — silently reintroducing the false advertisement.
     const s = source();
     const i = s.indexOf('const markExhausted =');
-    const body = s.slice(i, i + 900);
+    const body = s.slice(i, s.indexOf('\n};', i)); // the whole function, however long its lines
     expect(body).toContain('syncCompletionAdvertisement()');
     expect(body).toContain('scheduleAdvertisementResume(');
     // Monotonic: a refusal must never SHORTEN a longer window already in force.
@@ -92,7 +92,7 @@ describe('a last-resort refusal de-advertises the completion shapes', () => {
     const s = source();
     const i = s.indexOf('if ("refuse" in choice) {');
     const before = s.slice(Math.max(0, i - 1200), i);
-    expect(before).not.toContain('markExhausted("anthropic")');
+    expect(before).not.toMatch(/markExhausted\("anthropic"[,)]/);
   });
 
   it('NEGATIVE CONTROL: the assertions reject the pre-fix shape', () => {
@@ -101,7 +101,7 @@ describe('a last-resort refusal de-advertises the completion shapes', () => {
       console.warn(\`[llm-resolver-vessel] \${choice.refuse}\`);
       return { resolved: false, shape: "llmCompletion", error: choice.refuse };
     }`;
-    expect(/markExhausted\("anthropic"\)/.test(preFix)).toBe(false);
-    expect(/markExhausted\("openai"\)/.test(preFix)).toBe(false);
+    expect(/markExhausted\("anthropic"[,)]/.test(preFix)).toBe(false);
+    expect(/markExhausted\("openai"[,)]/.test(preFix)).toBe(false);
   });
 });

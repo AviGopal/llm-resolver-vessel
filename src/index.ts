@@ -40,6 +40,7 @@ import {
   VesselDaemon,
 } from "@avigopal/ias-executor-ts";
 import type { ResolverHandler } from "@avigopal/ias-executor-ts";
+import { reasonOf, reasonText } from "./exhaustion-reason";
 import { unwrapPointerBody } from "./pointer-body";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError, isPermanentModelError, escalatedCooldownMs } from "./provider-errors.js";
 import { isBlankText, reasoningPresent, emptyCompletionRefusal, isEmptyCompletion, emptyArmsOf, withEmptyArms, completionAnswered, emptyArmsToCharge } from "./empty-completion";
@@ -435,7 +436,7 @@ async function anthropicCreditFallback(
   // path fires exactly when the fleet is already degraded, which is the worst
   // moment to fall back onto a lane that is cooling down or cold-started.
   const fallbackModel = (await selectArm("credit_dead_fallback", [...modelClientMap.keys()].filter(isModelWilling)))?.model;
-  if (!fallbackModel) { markExhausted("anthropic", 30 * 60_000); return null; }
+  if (!fallbackModel) { markExhausted("anthropic", `credit balance too low, and no willing fallback: ${reasonText(reasonOf(err))}`, 30 * 60_000); return null; }
   const client = modelClientMap.get(fallbackModel);
   if (!client) return null;
   console.log(`[llm-resolver-vessel] anthropic credit-dead — falling back to ${fallbackModel}`);
@@ -551,8 +552,9 @@ async function resolveWithAnthropicUnobserved(body: LlmCompletionRequest): Promi
       const message = err instanceof Error ? err.message : String(err);
       const fallback = await anthropicCreditFallback(err, body);
       if (fallback) return fallback;
-      console.error("[llm-resolver-vessel] anthropic error:", message);
-      return { resolved: false, shape: "llmCompletion", error: message };
+      const provider_reason = reasonOf(err);
+      console.error(`[llm-resolver-vessel] anthropic error: ${reasonText(provider_reason)}`);
+      return { resolved: false, shape: "llmCompletion", error: message, provider_reason };
     }
 }
 
@@ -607,8 +609,9 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error("[llm-resolver-vessel] openai error:", message);
-      return { resolved: false, shape: "llmCompletion", error: message };
+      const provider_reason = reasonOf(err);
+      console.error(`[llm-resolver-vessel] openai error: ${reasonText(provider_reason)}`);
+      return { resolved: false, shape: "llmCompletion", error: message, provider_reason };
     }
 }
 
@@ -694,7 +697,9 @@ const PERMANENT_COOLDOWN_CAP_MS = 24 * 60 * 60 * 1000;
 const exhaustedUntil = new Map<string, number>();
 const providerKeyOf = (client: OpenAI): string => String((client as { baseURL?: unknown }).baseURL ?? "openai-wire");
 const inCooldown = (key: string): boolean => (exhaustedUntil.get(key) ?? 0) > Date.now();
-const markExhausted = (key: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
+// why: what the provider answered (reasonText of the failed result), or why the lane is cooled without one. Required, so a
+// mark that does not say why does not compile.
+const markExhausted = (key: string, why: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
   // MONOTONIC COOLDOWN. Never shorten a window already in force. A credit-dead
   // provider is deliberately cooled for 30 minutes by anthropicCreditFallback,
   // but the generic cooldownMsFor() call in the resolve path then re-marked the
@@ -704,7 +709,7 @@ const markExhausted = (key: string, ms: number = EXHAUSTION_COOLDOWN_MS): void =
   const until = Date.now() + ms;
   if ((exhaustedUntil.get(key) ?? 0) >= until) return;
   exhaustedUntil.set(key, until);
-  console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(ms / 1000)}s before retry`);
+  console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(ms / 1000)}s before retry — ${why}`);
   void syncCompletionAdvertisement();
   scheduleAdvertisementResume(ms);
 };
@@ -913,12 +918,12 @@ const scheduleAdvertisementResume = makeResumeScheduler({
   clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
   sync: () => void syncCompletionAdvertisement(),
 });
-const markModelExhausted = (m: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
+const markModelExhausted = (m: string, why: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
   // A mark while the model still cools leaves its expiry as it is (model-cooldown.ts): no slide, no repeat log.
   const { until, changed } = markedUntil(modelExhaustedUntil.get(m), Date.now(), ms);
   if (!changed) return;
   modelExhaustedUntil.set(m, until);
-  console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(ms / 1000)}s`);
+  console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(ms / 1000)}s — ${why}`);
   void syncCompletionAdvertisement();
   scheduleAdvertisementResume(ms);
 };
@@ -958,7 +963,7 @@ const walkFallbackModels = async (
     if (isEmptyCompletion(fb)) { empties.push(...emptyArmsOf(fb)); continue; }
     if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
     if (fb.dispatch_budget_exhausted === true) return fb; // the dispatch's allowance is spent for every model too
-    if (isFailoverError(fb.error)) markModelExhausted(fbModel, modelCooldownMsFor(fbModel, fb.error));
+    if (isFailoverError(fb.error)) markModelExhausted(fbModel, reasonText(fb.provider_reason), modelCooldownMsFor(fbModel, fb.error));
   }
   return null;
 };
@@ -993,7 +998,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
       return (await walkFallbackModels(body, model, empties)) ?? withEmptyArms(r, empties);
     }
     if (r.resolved === true || !isFailoverError(r.error)) return withEmptyArms(r, empties);
-    markModelExhausted(model, modelCooldownMsFor(model, r.error));
+    markModelExhausted(model, reasonText(r.provider_reason), modelCooldownMsFor(model, r.error));
     const walked = await walkFallbackModels(body, model, empties);
     return walked ?? withEmptyArms(r, empties);
   }
@@ -1009,7 +1014,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
       return (await walkFallbackModels(body, model, empties)) ?? withEmptyArms(r, empties);
     }
     if (r.resolved === true || !isFailoverError(r.error)) return r;
-    markModelExhausted(model, modelCooldownMsFor(model, r.error));
+    markModelExhausted(model, reasonText(r.provider_reason), modelCooldownMsFor(model, r.error));
     const walked = await walkFallbackModels(body, model, empties);
     return walked ?? withEmptyArms(r, empties);
   }
@@ -1041,7 +1046,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
     if (result.resolved === true) {
       clearExhausted(primaryKey);
     } else if (isFailoverError(result.error)) {
-      markExhausted(primaryKey, cooldownMsFor(result.error));
+      markExhausted(primaryKey, reasonText(result.provider_reason), cooldownMsFor(result.error));
     }
   }
   // An empty from the primary is walked past too, without cooling the primary.
@@ -1057,7 +1062,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
         clearExhausted(primaryKey);
         return retry;
       }
-      if (isFailoverError(retry.error)) markExhausted(primaryKey, cooldownMsFor(retry.error));
+      if (isFailoverError(retry.error)) markExhausted(primaryKey, reasonText(retry.provider_reason), cooldownMsFor(retry.error));
       return withEmptyArms(retry, empties);
     }
   }
@@ -1155,8 +1160,8 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
       // statement about lanes, and markExhausted is monotonic, re-syncs the
       // advertisement, and schedules its own resume — so recovery stays
       // condition-driven and a returning key re-advertises without traffic.
-      markExhausted("anthropic");
-      markExhausted("openai");
+      markExhausted("anthropic", `refused by the dispatch's choice: ${choice.refuse}`);
+      markExhausted("openai", `refused by the dispatch's choice: ${choice.refuse}`);
       return { resolved: false, shape: "llmCompletion", error: choice.refuse };
     }
     return llmCompletionHandler(ctx);

@@ -41,12 +41,15 @@ export interface Chain {
   grades: Array<{ model: string; ok: boolean }>;
   /** markModelExhausted / markExhausted calls. */
   exhaustionMarks: string[];
+  /** The why each of those calls passed, in the same order. */
+  exhaustionWhys: string[];
 }
 
 export function completionChain(opts: ChainOptions): Chain {
   const calls: string[] = [];
   const grades: Array<{ model: string; ok: boolean }> = [];
   const exhaustionMarks: string[] = [];
+  const exhaustionWhys: string[] = [];
   const cooling = new Set(opts.cooling ?? []);
   const modelClientMap = new Map<string, unknown>();
   for (const [model, turns] of opts.models) {
@@ -84,8 +87,8 @@ export function completionChain(opts: ChainOptions): Chain {
     inModelCooldown: (m: string) => cooling.has(m),
     isDenied: (m: string) => (opts.denied ?? []).some((d) => d !== "" && m.includes(d)),
     inCooldown: () => false,
-    markModelExhausted: (m: string) => { exhaustionMarks.push(m); cooling.add(m); },
-    markExhausted: (k: string) => { exhaustionMarks.push(k); },
+    markModelExhausted: (m: string, why: string) => { exhaustionMarks.push(m); exhaustionWhys.push(why); cooling.add(m); },
+    markExhausted: (k: string, why: string) => { exhaustionMarks.push(k); exhaustionWhys.push(why); },
     modelCooldownMsFor: () => 600_000,
     clearModelEscalation: () => {}, clearExhausted: () => {},
     providerKeyOf: (c: { baseURL?: string }) => String(c.baseURL),
@@ -108,6 +111,7 @@ export function completionChain(opts: ChainOptions): Chain {
   };
   // The empty-completion helpers, at a revision that has them.
   try { Object.assign(stubs, require("./empty-completion")); } catch { /* an earlier revision */ }
+  try { Object.assign(stubs, require("./exhaustion-reason")); } catch { /* an earlier revision */ }
   if (opts.completionHandler) stubs.llmCompletionHandler = opts.completionHandler;
   const names = [
     "llmCompletionWithPolicyHandler",
@@ -116,5 +120,5 @@ export function completionChain(opts: ChainOptions): Chain {
     "chargeEmptyCompletion",
   ];
   const fns = loadIndexDeclarations(names, stubs, ["chargeEmptyCompletion"]);
-  return { fns, calls, grades, exhaustionMarks };
+  return { fns, calls, grades, exhaustionMarks, exhaustionWhys };
 }
