@@ -65,6 +65,7 @@ function willingness(anthropic: unknown = null, cooling: string[] = []) {
     modelClientMap, openrouterClient, anthropic,
     isRunpodCold: () => false,
     inModelCooldown: () => false,
+    isDenied: () => false, // no owner denial in these tests (denied-models.test.ts covers it)
     inCooldown: (k: string) => cooling.includes(k),
     providerKeyOf: (c: { baseURL?: string }) => String(c.baseURL),
   };

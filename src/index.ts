@@ -43,7 +43,7 @@ import type { ResolverHandler } from "@avigopal/ias-executor-ts";
 import { unwrapPointerBody } from "./pointer-body";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError, isPermanentModelError, escalatedCooldownMs } from "./provider-errors.js";
 import { isBlankText, reasoningPresent, emptyCompletionRefusal, isEmptyCompletion, emptyArmsOf, withEmptyArms, completionAnswered, emptyArmsToCharge } from "./empty-completion";
-import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch } from "./model-policy.js";
+import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, lastPolicy, deniedBy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { decideLastResort } from "./last-resort.js";
 import { providerStanding, gateLogLine, type StandingEntry } from "./provider-standing.js";
@@ -856,10 +856,14 @@ const OPENROUTER_MODEL_SET: ReadonlySet<string> = new Set(
   OPENAI_WIRE_PROVIDERS.find((p) => p.id === "openrouter")?.models ?? [],
 );
 
+// A model the owner's policy denies (denied_models, model-policy.ts) is never drawn, walked to or called.
+const isDenied = (model: string): boolean => deniedBy(lastPolicy(), model);
+
 function isModelWilling(model: string): boolean {
   // Gating here (rather than at the policy) covers every consumer of
   // willingness at once — arm selection, the exhaustion failover walk and
   // quota-gated advertisement — so a cold lane cannot be reached down any path.
+  if (isDenied(model)) return false;
   if (isRunpodCold(model)) return false;
   const client = modelClientMap.get(model);
   if (client) return !inModelCooldown(model) && !inCooldown(providerKeyOf(client));
@@ -937,7 +941,7 @@ const walkFallbackModels = async (
   const order = fallbackWalkOrder([...modelClientMap.keys()], await readFallbackOrder());
   for (const fbModel of order) {
     const client = modelClientMap.get(fbModel);
-    if (!client || tried.has(fbModel) || inModelCooldown(fbModel)) continue;
+    if (!client || tried.has(fbModel) || inModelCooldown(fbModel) || isDenied(fbModel)) continue;
     // A provider held out by its standing (free cap, or N 402s, in the shaped window) is not
     // re-tried on every cooldown expiry: at most one probe per window (provider-standing.ts).
     if (!providerStanding.admit(fbModel, Date.now(), gate)) continue;
@@ -970,6 +974,12 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   // The arms that answered empty in this dispatch (empty-completion.ts): an empty is walked past
   // like a provider failure, but nothing is cooled for it.
   const empties: string[] = [];
+  // A model the owner's policy denies is never called: a permitted fallback answers, else the call is unserved.
+  if (isDenied(model)) {
+    const walked = await walkFallbackModels(body, model, empties);
+    return walked ?? { resolved: false, shape: "llmCompletion", unserved: "llm_completion", requested_model: model,
+      error: `model '${model}' is denied by the policy (denied_models) and no permitted model could serve` };
+  }
   const wireClient = modelClientMap.get(model);
   if (wireClient) {
     if (inModelCooldown(model)) {
@@ -1077,9 +1087,9 @@ const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
     // (and, when none do locally, to the de-advertise path so discovery routes to a peer
     // that can serve). This neutralises every hardcoded caller pin at the choke point.
     const pm = body.model as string;
-    const wireLive = modelClientMap.has(pm) && !inModelCooldown(pm);
+    const wireLive = modelClientMap.has(pm) && !inModelCooldown(pm) && !isDenied(pm);
     const prov = pickProvider(pm, body.provider);
-    const provLive = prov !== null && !inCooldown(prov);
+    const provLive = prov !== null && !inCooldown(prov) && !isDenied(pm);
     if (wireLive || provLive) return llmCompletionHandler(ctx);
     // pinned arm is dry → drop the pin and select a live arm by policy below.
   }

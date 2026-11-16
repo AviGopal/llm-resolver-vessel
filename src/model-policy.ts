@@ -49,6 +49,10 @@ export interface ModelPolicy {
   /** The order the exhaustion fallback walk tries models in: these first, in this order, then
    * every other routable model in registry order. Unset means registry order. */
   fallback_order?: string[];
+  /** Models no call may be answered by (the USER, 11-15: "No free endpoints"): a model whose id contains any entry is
+   * never drawn, walked to or called, and a call with no permitted model left is answered unserved. The entries are the
+   * owner's (e.g. a tier suffix); the code names none. Unset or empty: nothing is denied. */
+  denied_models?: string[];
 }
 
 /**
@@ -173,6 +177,13 @@ const DEFAULT_POLICY: ModelPolicy = {
 };
 
 let cached: { at: number; policy: ModelPolicy } | null = null;
+
+/** The policy as last read (loadPolicy refreshes it), for checks that cannot await; null before the first read. */
+export const lastPolicy = (): ModelPolicy | null => cached?.policy ?? null;
+
+/** Whether the policy denies a model: its id contains one of the owner's denied_models entries. */
+export const deniedBy = (policy: Pick<ModelPolicy, "denied_models"> | null | undefined, model: string): boolean =>
+  (policy?.denied_models ?? []).some((d) => typeof d === "string" && d !== "" && model.includes(d));
 
 export async function loadPolicy(): Promise<ModelPolicy> {
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.policy;
@@ -466,12 +477,13 @@ export async function llmModelPolicyHandler(): Promise<{ resolved: boolean; shap
 }
 
 export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promise<{ resolved: boolean; shape: string; body?: unknown; error?: string }> {
-  const req = ctx.body as { arms?: PolicyArm[]; cost_weight?: number; merge?: boolean; provider_gate_credit_402s?: number | null; fallback_order?: string[] | null } & Partial<Record<DefaultedPolicyField, number | null>>;
+  const req = ctx.body as { arms?: PolicyArm[]; cost_weight?: number; merge?: boolean; provider_gate_credit_402s?: number | null; fallback_order?: string[] | null; denied_models?: string[] | null } & Partial<Record<DefaultedPolicyField, number | null>>;
   const fields = req != null && typeof req === "object" ? DEFAULTED_FIELDS.filter((f) => f in req) : [];
   const hasGateN = req != null && typeof req === "object" && "provider_gate_credit_402s" in req;
   const hasOrder = req != null && typeof req === "object" && "fallback_order" in req;
-  if (!req || (!Array.isArray(req.arms) && typeof req.cost_weight !== "number" && fields.length === 0 && !hasGateN && !hasOrder)) {
-    return { resolved: false, shape: "llmModelPolicyWriteResult", error: `body must include arms[], cost_weight and/or one of ${[...DEFAULTED_FIELDS, "provider_gate_credit_402s", "fallback_order"].join(", ")}` };
+  const hasDenied = req != null && typeof req === "object" && "denied_models" in req;
+  if (!req || (!Array.isArray(req.arms) && typeof req.cost_weight !== "number" && fields.length === 0 && !hasGateN && !hasOrder && !hasDenied)) {
+    return { resolved: false, shape: "llmModelPolicyWriteResult", error: `body must include arms[], cost_weight and/or one of ${[...DEFAULTED_FIELDS, "provider_gate_credit_402s", "fallback_order", "denied_models"].join(", ")}` };
   }
   if (hasOrder) {
     const o = req.fallback_order;
@@ -483,6 +495,12 @@ export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promis
     const n = req.provider_gate_credit_402s;
     if (n !== null && !(typeof n === "number" && Number.isInteger(n) && n >= 1)) {
       return { resolved: false, shape: "llmModelPolicyWriteResult", error: "provider_gate_credit_402s must be an integer >= 1, or null to use the default" };
+    }
+  }
+  if (hasDenied) {
+    const d = req.denied_models;
+    if (d !== null && !(Array.isArray(d) && d.every((m) => typeof m === "string" && m.length > 0))) {
+      return { resolved: false, shape: "llmModelPolicyWriteResult", error: "denied_models must be an array of non-empty strings, or null to deny nothing" };
     }
   }
   for (const f of fields) {
@@ -500,6 +518,10 @@ export async function llmModelPolicyWriteHandler(ctx: { body: unknown }): Promis
   if (hasOrder) {
     if (req.fallback_order === null || req.fallback_order === undefined) delete policy.fallback_order;
     else policy.fallback_order = [...req.fallback_order];
+  }
+  if (hasDenied) {
+    if (req.denied_models === null || req.denied_models === undefined) delete policy.denied_models;
+    else policy.denied_models = [...req.denied_models];
   }
   for (const f of fields) {
     const v = req[f];

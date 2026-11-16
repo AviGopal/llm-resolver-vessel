@@ -27,6 +27,8 @@ export interface ChainOptions {
   selectionMeta?: Record<string, unknown>;
   /** Models already in cooldown when the call starts. */
   cooling?: string[];
+  /** The owner's denied_models entries in force (none by default). */
+  denied?: string[];
   /** Replaces the real llmCompletionHandler (to hand the policy handler a fixed result). */
   completionHandler?: (ctx: { body: Record<string, unknown> }) => Promise<Record<string, unknown>>;
 }
@@ -80,6 +82,7 @@ export function completionChain(opts: ChainOptions): Chain {
     modelClientMap,
     providerStanding: standing,
     inModelCooldown: (m: string) => cooling.has(m),
+    isDenied: (m: string) => (opts.denied ?? []).some((d) => d !== "" && m.includes(d)),
     inCooldown: () => false,
     markModelExhausted: (m: string) => { exhaustionMarks.push(m); cooling.add(m); },
     markExhausted: (k: string) => { exhaustionMarks.push(k); },
