@@ -202,13 +202,53 @@ describe("a lane refused at the provider level is held until a probe to it is se
     expect(w.advertised()).toBe(true);
   });
 
-  test("[GUARD] a call the lane serves on its own path (clearExhausted) releases it too", async () => {
+  test("[GUARD] a call the lane serves on its own path (clearExhausted) releases it too; its pending probe then calls nothing", async () => {
     const w = world({ claude: true });
     await w.fns.syncCompletionAdvertisement();
     w.fns.markExhausted("anthropic", "credit balance too low", 30 * MIN, w.holds("credit balance too low"));
     await w.flush();
     w.fns.clearExhausted("anthropic");
     expect([w.fns.inCooldown("anthropic"), w.fns.isModelWilling(CLAUDE)]).toEqual([false, true]);
+    await w.at(35 * MIN);
+    expect(w.probes.filter((p) => p.lane === "anthropic")).toEqual([]);
+    expect([w.fns.inCooldown("anthropic"), w.fns.isModelWilling(CLAUDE)]).toEqual([false, true]);
+  });
+
+  test("[MUST-FAIL] a held lane whose window a later mark lengthened is probed once, at the window's end, and is never stranded", async () => {
+    const w = world({ claude: true });
+    await w.fns.syncCompletionAdvertisement();
+    w.answers.set("anthropic", refused(UNREACHABLE));
+    w.fns.markExhausted("anthropic", UNREACHABLE, 30_000, true);
+    await w.at(10_000);
+    // a last-resort retry refused for billing lengthens the window while the first probe is pending
+    w.fns.markExhausted("anthropic", BILLING, 10 * MIN, true);
+    await w.at(10 * MIN);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(0);
+    // the probe's answer is still out when every timer due at the window's end has fired: one probe, not two
+    let answer: (r: Record<string, unknown>) => void = () => {};
+    w.answers.set("anthropic", (() => new Promise((res) => { answer = res; })) as never);
+    await w.at(10 * MIN + 10_001);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(1);
+    // refused unreachable again: held for that window, its probe pending; then served, released
+    answer(refused(UNREACHABLE));
+    await w.flush();
+    w.answers.set("anthropic", served);
+    await w.at(12 * MIN);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(2);
+    expect([w.fns.inCooldown("anthropic"), w.fns.isModelWilling(CLAUDE)]).toEqual([false, true]);
+  });
+
+  test("[MUST-FAIL] a held mark that leaves a longer window in force still holds the lane and leaves its probe pending", async () => {
+    const w = world({ claude: true });
+    await w.fns.syncCompletionAdvertisement();
+    w.fns.markExhausted("anthropic", RATE, 20 * MIN, false);
+    w.fns.markExhausted("anthropic", BILLING, 10 * MIN, true);
+    await w.at(25 * MIN);
+    expect(w.fns.inCooldown("anthropic")).toBe(true);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(1);
+    w.answers.set("anthropic", served);
+    await w.at(36 * MIN);
+    expect(w.fns.inCooldown("anthropic")).toBe(false);
   });
 });
 

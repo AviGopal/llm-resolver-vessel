@@ -718,13 +718,15 @@ const markExhausted = (key: string, why: string, ms: number = EXHAUSTION_COOLDOW
   // lane was retried three times more often than intended, and every retry
   // re-flipped the llm_completion advertisement through discovery. Only extend.
   const until = Date.now() + ms;
+  // Held before the monotonic return: a held lane gets no traffic, so a mark that leaves a longer window in force must
+  // still hold it and leave a probe pending, or nothing would ever end the hold.
+  // (a probe due before a longer window in force ends moves itself to that window's end: probeHeldLane)
+  if (held) { heldUntilServed.add(key); scheduleProbe(key, ms); }
   if ((exhaustedUntil.get(key) ?? 0) >= until) return;
   exhaustedUntil.set(key, until);
   console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(ms / 1000)}s before retry${held ? ", then held until a probe is served" : ""} — ${why}`);
-  if (held) heldUntilServed.add(key);
   void syncCompletionAdvertisement();
-  if (held) scheduleProbe(key, ms);
-  else scheduleAdvertisementResume(ms);
+  if (!held) scheduleAdvertisementResume(ms);
 };
 const clearExhausted = (key: string): void => {
   const wasHeld = heldUntilServed.delete(key);
@@ -935,6 +937,8 @@ const scheduleAdvertisementResume = makeResumeScheduler({
 const markModelExhausted = (m: string, why: string, ms: number = EXHAUSTION_COOLDOWN_MS, held = false): void => {
   // A mark while the model still cools leaves its expiry as it is (model-cooldown.ts): no slide, no repeat log.
   const { until, changed } = markedUntil(modelExhaustedUntil.get(m), Date.now(), ms);
+  // (a model's running window is never lengthened, so its pending probe always fires at the window's end: a mark that
+  // changes nothing leaves a held model with its probe still pending)
   if (!changed) return;
   modelExhaustedUntil.set(m, until);
   console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(ms / 1000)}s${held ? ", then held until a probe is served" : ""} — ${why}`);
@@ -948,7 +952,8 @@ const markModelExhausted = (m: string, why: string, ms: number = EXHAUSTION_COOL
 // the lane, the hold and the cooldown end and the advertisement is synced, so a re-advertise follows an answer, never
 // a clock. Refused by a rate limit, the lane is cooled for it and returns by its timer, as any rate-limited lane does.
 // Refused otherwise, or answered only by a fallback in its place, nothing says the lane recovered: it is held for
-// another window. One pending probe per lane. max_tokens is the smallest some providers accept (a smaller one is
+// another window. One pending probe per lane; a held mark always leaves one pending (at its lane's window end).
+// max_tokens is the smallest some providers accept (a smaller one is
 // refused as a bad request, which would read as no recovery).
 const PROBE_BODY = { type: "llm_completion", prompt: "Reply with OK.", max_tokens: 16 } as const;
 const probeTimers = new Map<string, unknown>();
@@ -961,6 +966,9 @@ const scheduleProbe = (key: string, ms: number): void => {
 async function probeHeldLane(key: string): Promise<void> {
   if (!heldUntilServed.has(key)) return;
   const isProvider = key === "anthropic" || key === "openai";
+  // A window a later mark lengthened while this probe was pending still runs: probe at its end instead.
+  const until = (isProvider ? exhaustedUntil : modelExhaustedUntil).get(key) ?? 0;
+  if (until > Date.now()) { scheduleProbe(key, until - Date.now()); return; }
   const client = isProvider ? null : modelClientMap.get(key) ?? openrouterClient;
   if (!isProvider && client === null) return;
   const r = key === "anthropic" ? await resolveWithAnthropic({ ...PROBE_BODY })
