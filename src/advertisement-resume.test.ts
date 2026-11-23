@@ -74,7 +74,7 @@ describe("advertisement resume", () => {
   test("[MUST-FAIL] index.ts reschedules from the sync itself when it finds no quota, and logs each change", () => {
     const src = readFileSync(join(import.meta.dir, "index.ts"), "utf8");
     const body = src.slice(src.indexOf("async function syncCompletionAdvertisement()"), src.indexOf("async function llmQuotaStateHandler"));
-    expect(body).toContain("nextResyncInMs(drawable, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()])");
+    expect(body).toContain("nextResyncInMs(drawable, Date.now(), timedExpiries([...exhaustedUntil, ...modelExhaustedUntil], heldUntilServed))");
     expect(body).toContain("if (resyncIn !== null) scheduleAdvertisementResume(resyncIn);");
     expect(body).toContain("advertisementChange(completionAdvertised, quota, resyncIn)");
   });

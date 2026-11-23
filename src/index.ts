@@ -30,7 +30,7 @@
 
 import { coolingRefusal, markedUntil } from "./model-cooldown";
 import { countOutcome } from "./call-outcome";
-import { advertiseQuota, advertisementChange, completionQuota, makeLatest, makeResumeScheduler, nextResyncInMs } from "./advertisement-resume";
+import { advertiseQuota, advertisementChange, completionQuota, makeLatest, makeResumeScheduler, nextResyncInMs, timedExpiries } from "./advertisement-resume";
 import Anthropic from "@anthropic-ai/sdk";
 import { isScaleToZeroCold, isWarmFromHealth } from "./scale-to-zero";
 import OpenAI from "openai";
@@ -296,7 +296,7 @@ async function syncCompletionAdvertisement(): Promise<void> {
   if (!syncTurn.isLatest(ticket)) return;
   // With no drawable arm, the next re-sync is at the soonest cooldown still running, so a resume that fired while another
   // lane still cooled is followed by another (advertisement-resume.ts).
-  const resyncIn = nextResyncInMs(drawable, Date.now(), [...exhaustedUntil.values(), ...modelExhaustedUntil.values()]);
+  const resyncIn = nextResyncInMs(drawable, Date.now(), timedExpiries([...exhaustedUntil, ...modelExhaustedUntil], heldUntilServed));
   // An arm unwilling for a reason no cooldown ends (a cold scale-to-zero arm, an arm with no client) schedules nothing,
   // and a dropped shape receives no call to recover it: then advertise on the old, wider check rather than strand (qa).
   const quota = advertiseQuota(drawable, resyncIn !== null, () => hasCompletionQuota());
@@ -436,7 +436,7 @@ async function anthropicCreditFallback(
   // path fires exactly when the fleet is already degraded, which is the worst
   // moment to fall back onto a lane that is cooling down or cold-started.
   const fallbackModel = (await selectArm("credit_dead_fallback", [...modelClientMap.keys()].filter(isModelWilling)))?.model;
-  if (!fallbackModel) { markExhausted("anthropic", `credit balance too low, and no willing fallback: ${reasonText(reasonOf(err))}`, 30 * 60_000); return null; }
+  if (!fallbackModel) { markExhausted("anthropic", `credit balance too low, and no willing fallback: ${reasonText(reasonOf(err))}`, 30 * 60_000, true); return null; }
   const client = modelClientMap.get(fallbackModel);
   if (!client) return null;
   console.log(`[llm-resolver-vessel] anthropic credit-dead — falling back to ${fallbackModel}`);
@@ -695,11 +695,22 @@ const RATE_LIMIT_COOLDOWN_MS =
 const PERMANENT_COOLDOWN_DOUBLING = 2;
 const PERMANENT_COOLDOWN_CAP_MS = 24 * 60 * 60 * 1000;
 const exhaustedUntil = new Map<string, number>();
+// A LANE HELD UNTIL SERVED. A provider-level refusal (billing, an unreachable host, a refused credential: the class
+// the arm is not graded on) is not ended by time. Re-advertised at its cooldown's expiry, the next call was refused
+// the same way, the lane cooled and was dropped again, and each re-advertise had discovery record the shape served
+// again, releasing held walk moves into the same refusal (live: about 55 cycles an hour through a credit outage). So
+// such a lane (a provider key or a model id) stays cooling after its window too, its expiry is left out of the re-sync
+// timer, and it returns only when one probe call to it at that expiry is served (a recovery is a served answer, not a
+// clock). A probe refused again holds it for another window, with nothing advertised. A rate limit ends by time and
+// keeps the timer.
+const heldUntilServed = new Set<string>();
+// Of the refusals that cool a lane (isFailoverError), the ones that hold it until served: all but a rate limit.
+const holdsUntilServed = (e: unknown): boolean => !isRateLimitError(e);
 const providerKeyOf = (client: OpenAI): string => String((client as { baseURL?: unknown }).baseURL ?? "openai-wire");
-const inCooldown = (key: string): boolean => (exhaustedUntil.get(key) ?? 0) > Date.now();
+const inCooldown = (key: string): boolean => heldUntilServed.has(key) || (exhaustedUntil.get(key) ?? 0) > Date.now();
 // why: what the provider answered (reasonText of the failed result), or why the lane is cooled without one. Required, so a
 // mark that does not say why does not compile.
-const markExhausted = (key: string, why: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
+const markExhausted = (key: string, why: string, ms: number = EXHAUSTION_COOLDOWN_MS, held = false): void => {
   // MONOTONIC COOLDOWN. Never shorten a window already in force. A credit-dead
   // provider is deliberately cooled for 30 minutes by anthropicCreditFallback,
   // but the generic cooldownMsFor() call in the resolve path then re-marked the
@@ -709,12 +720,15 @@ const markExhausted = (key: string, why: string, ms: number = EXHAUSTION_COOLDOW
   const until = Date.now() + ms;
   if ((exhaustedUntil.get(key) ?? 0) >= until) return;
   exhaustedUntil.set(key, until);
-  console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(ms / 1000)}s before retry — ${why}`);
+  console.warn(`[llm-resolver-vessel] provider '${key}' marked exhausted — cooling down ${Math.round(ms / 1000)}s before retry${held ? ", then held until a probe is served" : ""} — ${why}`);
+  if (held) heldUntilServed.add(key);
   void syncCompletionAdvertisement();
-  scheduleAdvertisementResume(ms);
+  if (held) scheduleProbe(key, ms);
+  else scheduleAdvertisementResume(ms);
 };
 const clearExhausted = (key: string): void => {
-  if (exhaustedUntil.delete(key)) {
+  const wasHeld = heldUntilServed.delete(key);
+  if (exhaustedUntil.delete(key) || wasHeld) {
     console.warn(`[llm-resolver-vessel] provider '${key}' recovered — resuming preferred routing`);
     void syncCompletionAdvertisement();
   }
@@ -776,7 +790,7 @@ const cooldownMsFor = (e: unknown): number => {
 // a paid-model 402 (2026-07-18 completion-plane outage). Cool down the failing
 // MODEL; siblings on the same client stay eligible.
 const modelExhaustedUntil = new Map<string, number>();
-const inModelCooldown = (m: string): boolean => (modelExhaustedUntil.get(m) ?? 0) > Date.now();
+const inModelCooldown = (m: string): boolean => heldUntilServed.has(m) || (modelExhaustedUntil.get(m) ?? 0) > Date.now();
 // Consecutive permanent-class errors per model, beside the window they size. Only a
 // permanent-class error increments it; any other failure leaves it alone (a 429
 // says nothing about whether the slug became servable); only a success resets it.
@@ -918,15 +932,55 @@ const scheduleAdvertisementResume = makeResumeScheduler({
   clearTimer: (t) => clearTimeout(t as ReturnType<typeof setTimeout>),
   sync: () => void syncCompletionAdvertisement(),
 });
-const markModelExhausted = (m: string, why: string, ms: number = EXHAUSTION_COOLDOWN_MS): void => {
+const markModelExhausted = (m: string, why: string, ms: number = EXHAUSTION_COOLDOWN_MS, held = false): void => {
   // A mark while the model still cools leaves its expiry as it is (model-cooldown.ts): no slide, no repeat log.
   const { until, changed } = markedUntil(modelExhaustedUntil.get(m), Date.now(), ms);
   if (!changed) return;
   modelExhaustedUntil.set(m, until);
-  console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(ms / 1000)}s — ${why}`);
+  console.warn(`[llm-resolver-vessel] model '${m}' marked exhausted — cooling down ${Math.round(ms / 1000)}s${held ? ", then held until a probe is served" : ""} — ${why}`);
+  if (held) heldUntilServed.add(m);
   void syncCompletionAdvertisement();
-  scheduleAdvertisementResume(ms);
+  if (held) scheduleProbe(m, ms);
+  else scheduleAdvertisementResume(ms);
 };
+
+// The probe of a held lane, at its window's expiry: one short call to that lane alone (no fallback walk). Served by
+// the lane, the hold and the cooldown end and the advertisement is synced, so a re-advertise follows an answer, never
+// a clock. Refused by a rate limit, the lane is cooled for it and returns by its timer, as any rate-limited lane does.
+// Refused otherwise, or answered only by a fallback in its place, nothing says the lane recovered: it is held for
+// another window. One pending probe per lane. max_tokens is the smallest some providers accept (a smaller one is
+// refused as a bad request, which would read as no recovery).
+const PROBE_BODY = { type: "llm_completion", prompt: "Reply with OK.", max_tokens: 16 } as const;
+const probeTimers = new Map<string, unknown>();
+const scheduleProbe = (key: string, ms: number): void => {
+  if (probeTimers.has(key)) return;
+  const t = setTimeout(() => { probeTimers.delete(key); void probeHeldLane(key); }, ms);
+  (t as { unref?: () => void }).unref?.();
+  probeTimers.set(key, t);
+};
+async function probeHeldLane(key: string): Promise<void> {
+  if (!heldUntilServed.has(key)) return;
+  const isProvider = key === "anthropic" || key === "openai";
+  const client = isProvider ? null : modelClientMap.get(key) ?? openrouterClient;
+  if (!isProvider && client === null) return;
+  const r = key === "anthropic" ? await resolveWithAnthropic({ ...PROBE_BODY })
+    : key === "openai" ? await resolveWithOpenAI({ ...PROBE_BODY })
+    : await resolveWithOpenAI({ ...PROBE_BODY, model: key }, client);
+  // served by this lane: an answer a fallback gave in its place is not this lane's recovery
+  if (r.resolved === true && r.fallback_from === undefined) {
+    console.warn(`[llm-resolver-vessel] probe of held lane '${key}' served — releasing it`);
+    heldUntilServed.delete(key);
+    if (isProvider) clearExhausted(key);
+    else { modelExhaustedUntil.delete(key); void syncCompletionAdvertisement(); }
+    return;
+  }
+  console.warn(`[llm-resolver-vessel] probe of held lane '${key}' ${r.resolved === true ? "answered only by a fallback" : "refused"}`);
+  // (a fallback's answer carries no error: held, as nothing says this lane recovered)
+  const held = holdsUntilServed(r.error);
+  if (!held) heldUntilServed.delete(key);
+  if (isProvider) markExhausted(key, reasonText(r.provider_reason), cooldownMsFor(r.error), held);
+  else markModelExhausted(key, reasonText(r.provider_reason), modelCooldownMsFor(key, r.error), held);
+}
 
 // Shared billing-exhaustion fallback: walk every keyed wire model not in its
 // own cooldown, in the shaped llmModelPolicy.fallback_order, then registry
@@ -963,7 +1017,7 @@ const walkFallbackModels = async (
     if (isEmptyCompletion(fb)) { empties.push(...emptyArmsOf(fb)); continue; }
     if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
     if (fb.dispatch_budget_exhausted === true) return fb; // the dispatch's allowance is spent for every model too
-    if (isFailoverError(fb.error)) markModelExhausted(fbModel, reasonText(fb.provider_reason), modelCooldownMsFor(fbModel, fb.error));
+    if (isFailoverError(fb.error)) markModelExhausted(fbModel, reasonText(fb.provider_reason), modelCooldownMsFor(fbModel, fb.error), holdsUntilServed(fb.error));
   }
   return null;
 };
@@ -998,7 +1052,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
       return (await walkFallbackModels(body, model, empties)) ?? withEmptyArms(r, empties);
     }
     if (r.resolved === true || !isFailoverError(r.error)) return withEmptyArms(r, empties);
-    markModelExhausted(model, reasonText(r.provider_reason), modelCooldownMsFor(model, r.error));
+    markModelExhausted(model, reasonText(r.provider_reason), modelCooldownMsFor(model, r.error), holdsUntilServed(r.error));
     const walked = await walkFallbackModels(body, model, empties);
     return walked ?? withEmptyArms(r, empties);
   }
@@ -1014,7 +1068,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
       return (await walkFallbackModels(body, model, empties)) ?? withEmptyArms(r, empties);
     }
     if (r.resolved === true || !isFailoverError(r.error)) return r;
-    markModelExhausted(model, reasonText(r.provider_reason), modelCooldownMsFor(model, r.error));
+    markModelExhausted(model, reasonText(r.provider_reason), modelCooldownMsFor(model, r.error), holdsUntilServed(r.error));
     const walked = await walkFallbackModels(body, model, empties);
     return walked ?? withEmptyArms(r, empties);
   }
@@ -1046,7 +1100,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
     if (result.resolved === true) {
       clearExhausted(primaryKey);
     } else if (isFailoverError(result.error)) {
-      markExhausted(primaryKey, reasonText(result.provider_reason), cooldownMsFor(result.error));
+      markExhausted(primaryKey, reasonText(result.provider_reason), cooldownMsFor(result.error), holdsUntilServed(result.error));
     }
   }
   // An empty from the primary is walked past too, without cooling the primary.
@@ -1062,7 +1116,7 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
         clearExhausted(primaryKey);
         return retry;
       }
-      if (isFailoverError(retry.error)) markExhausted(primaryKey, reasonText(retry.provider_reason), cooldownMsFor(retry.error));
+      if (isFailoverError(retry.error)) markExhausted(primaryKey, reasonText(retry.provider_reason), cooldownMsFor(retry.error), holdsUntilServed(retry.error));
       return withEmptyArms(retry, empties);
     }
   }

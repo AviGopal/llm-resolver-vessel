@@ -17,6 +17,13 @@ export const nextResyncInMs = (quota: boolean, now: number, expiries: Iterable<n
   return soonest === Infinity ? null : soonest - now;
 };
 
+/**
+ * The cooldown expiries a timer may re-check at: a lane held until served (a billing-class refusal, which no window
+ * ends) is left out, so its expiry never re-advertises; it returns on a served probe instead.
+ */
+export const timedExpiries = (until: Iterable<[string, number]>, held: ReadonlySet<string>): number[] =>
+  [...until].filter(([key]) => !held.has(key)).map(([, at]) => at);
+
 export type ResumeDeps = {
   now: () => number;
   setTimer: (fn: () => void, ms: number) => unknown;
