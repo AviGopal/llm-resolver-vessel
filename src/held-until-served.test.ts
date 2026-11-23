@@ -24,12 +24,12 @@ const NAMES = [
   "modelPermanentStreak", "isHardExhaustedError", "isRateLimitError", "UNAUTHENTICATED_COOLDOWN_MS", "cooldownMsFor", "modelCooldownMsFor",
   "isModelWilling", "hasCompletionQuota", "completionAdvertised", "syncTurn", "syncCompletionAdvertisement", "scheduleAdvertisementResume",
   "markExhausted", "clearExhausted", "markModelExhausted", "PROBE_BODY", "probeTimers", "scheduleProbe", "probeHeldLane",
-  "anthropicCreditFallback", "walkFallbackModels", "llmCompletionHandler",
+  "anthropicCreditFallback", "walkFallbackModels", "llmCompletionHandler", "llmQuotaStateHandler",
 ];
 const NEW = ["heldUntilServed", "holdsUntilServed", "PROBE_BODY", "probeTimers", "scheduleProbe", "probeHeldLane"];
 
 /** The shipped functions over two wire models (and the anthropic lane, when `claude`), a fake clock and fake timers. */
-function world(o: { claude?: boolean; cold?: boolean; wire?: boolean; openai?: boolean; openrouter?: boolean } = {}) {
+function world(o: { claude?: boolean; cold?: boolean; wire?: boolean; openai?: boolean; openrouter?: boolean; wireProvider?: boolean } = {}) {
   let clock = 1_000_000;
   const timers: Array<{ at: number; fn: () => void; live: boolean }> = [];
   const shapes: string[][] = [];
@@ -45,14 +45,14 @@ function world(o: { claude?: boolean; cold?: boolean; wire?: boolean; openai?: b
     EXHAUSTION_COOLDOWN_MS: 10 * MIN, RATE_LIMIT_COOLDOWN_MS: 45_000, UNREACHABLE_COOLDOWN_MS: 30_000,
     PERMANENT_COOLDOWN_DOUBLING: 2, PERMANENT_COOLDOWN_CAP_MS: 24 * 60 * MIN,
     ...ad, markedUntil, escalatedCooldownMs, isPermanentModelError, isUnauthenticatedProviderError, isUnreachableProviderError,
-    LLM_PINNED_PROVIDER: null, OPENAI_WIRE_PROVIDERS: [],
+    LLM_PINNED_PROVIDER: null, OPENAI_WIRE_PROVIDERS: o.wireProvider ? [{ id: "vendor", baseURL: client.baseURL, models: [PAID, FREE] }] : [],
     modelClientMap: new Map(o.wire === false ? [] : [[PAID, client], [FREE, client]]),
     anthropic: o.claude ? {} : null, openaiClient: o.openai ? openai : null, openrouterClient: o.openrouter ? client : null, OPENROUTER_MODEL_SET: new Set(),
     isDenied: () => false, isRunpodCold: () => o.cold === true,
     loadPolicy: async () => ({ arms: [...(o.wire === false ? [] : [PAID, FREE]), ...(o.claude ? [CLAUDE] : [])].map((model) => ({ model })) }),
     isFailoverError, isEmptyCompletion, emptyArmsOf, withEmptyArms, coolingRefusal, DEFAULT_MODEL: CLAUDE,
     readGateParams: async () => ({}), readFallbackOrder: async () => [], fallbackWalkOrder: (keys: string[]) => keys,
-    providerStanding: { admit: () => true, recordFallback() {} },
+    providerStanding: { admit: () => true, recordFallback() {}, entry: () => ({}), providerOf: () => null },
     selectArm: async (_t: string, models: string[]) => (models.length > 0 ? { model: models[0] } : null),
     reasonOf: (e: unknown) => ({ message: String(e) }),
     pickProvider: (m: string) => (m.startsWith("claude") ? (o.claude ? "anthropic" : null) : o.openai ? "openai" : null),
@@ -71,8 +71,10 @@ function world(o: { claude?: boolean; cold?: boolean; wire?: boolean; openai?: b
   const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
   /** Move the clock to `ms` past the start, firing each timer due on the way, in order. */
   const start = clock;
+  // A timer that keeps rescheduling itself at the same moment never lets the clock move: that fails the leg, not the run.
   const at = async (ms: number) => {
-    for (;;) {
+    for (let fired = 0; ; fired++) {
+      if (fired > 10_000) throw new Error(`timers due by ${ms} ms never settled`);
       const due = timers.filter((t) => t.live && t.at <= start + ms).sort((a, b) => a.at - b.at)[0];
       if (!due) break;
       due.live = false;
@@ -366,5 +368,47 @@ describe("each call site that cools a lane for a provider's refusal holds it", (
     await ask(w, CLAUDE);
     await w.at(2 * MIN);
     expect([w.fns.inCooldown("anthropic"), w.fns.inModelCooldown(PAID), w.fns.inModelCooldown(FREE)]).toEqual([false, false, false]);
+  });
+});
+
+describe("a lane's window ends at its until: cooling before it, not at it", () => {
+  const START = 1_000_000;
+  const quota = async (fns: Record<string, any>) => ((await fns.llmQuotaStateHandler({ body: {} })).body as { providers: Record<string, { cooldown_until_ms: number | null }> }).providers;
+
+  test("[GUARD] a provider's window: cooling and reported a millisecond before its end, neither at it", async () => {
+    const w = world({ claude: true, wireProvider: true });
+    w.fns.markExhausted("anthropic", RATE, 30_000, false);
+    const end = w.fns.exhaustedUntil.get("anthropic") as number;
+    // a wire provider's window is reported from the same map, keyed by its base URL
+    w.fns.exhaustedUntil.set("https://wire.example/v1", end);
+    await w.at(end - START - 1);
+    expect(w.fns.inCooldown("anthropic")).toBe(true);
+    expect((await quota(w.fns)).anthropic.cooldown_until_ms).toBe(end);
+    expect((await quota(w.fns)).vendor.cooldown_until_ms).toBe(end);
+    await w.at(end - START);
+    expect(w.fns.inCooldown("anthropic")).toBe(false);
+    expect((await quota(w.fns)).anthropic.cooldown_until_ms).toBe(null);
+    expect((await quota(w.fns)).vendor.cooldown_until_ms).toBe(null);
+  });
+
+  test("[GUARD] a model's window: cooling a millisecond before its end, not at it", async () => {
+    const w = world();
+    await w.refuseModel(PAID, RATE);
+    const end = w.fns.modelExhaustedUntil.get(PAID) as number;
+    await w.at(end - START - 1);
+    expect(w.fns.inModelCooldown(PAID)).toBe(true);
+    await w.at(end - START);
+    expect(w.fns.inModelCooldown(PAID)).toBe(false);
+  });
+
+  test("[GUARD] a held lane's probe due exactly at its window's end calls the lane then", async () => {
+    const w = world({ claude: true });
+    await w.fns.syncCompletionAdvertisement();
+    w.answers.set("anthropic", served);
+    w.fns.markExhausted("anthropic", UNREACHABLE, 30_000, true);
+    const end = w.fns.exhaustedUntil.get("anthropic") as number;
+    await w.at(end - START);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(1);
+    expect(w.fns.inCooldown("anthropic")).toBe(false);
   });
 });
