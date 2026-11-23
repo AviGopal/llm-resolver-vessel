@@ -140,12 +140,16 @@ export function completionChain(opts: ChainOptions): Chain {
   try { Object.assign(stubs, require("./empty-completion")); } catch { /* an earlier revision */ }
   try { Object.assign(stubs, require("./exhaustion-reason")); } catch { /* an earlier revision */ }
   if (opts.completionHandler) stubs.llmCompletionHandler = opts.completionHandler;
+  const CLASS = ["holdsUntilServed", "isRateLimitError", "isHardExhaustedError"];
   const names = [
     "llmCompletionWithPolicyHandler",
     ...(opts.completionHandler ? [] : ["llmCompletionHandler"]),
     "walkFallbackModels", "resolveWithOpenAI", "resolveWithOpenAIUnobserved",
     "chargeEmptyCompletion",
+    // the refusal class the mark sites pass on (held until served, or timed), as index.ts declares it, at a revision
+    // that has it
+    ...CLASS,
   ];
-  const fns = loadIndexDeclarations(names, stubs, ["chargeEmptyCompletion"]);
+  const fns = loadIndexDeclarations(names, stubs, ["chargeEmptyCompletion", ...CLASS]);
   return { fns, calls, grades, exhaustionMarks, exhaustionWhys };
 }
