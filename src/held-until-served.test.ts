@@ -5,7 +5,9 @@ import { describe, expect, test } from "bun:test";
 import { loadIndexDeclarations } from "./index-fn-harness";
 import * as ad from "./advertisement-resume";
 import { markedUntil } from "./model-cooldown";
-import { escalatedCooldownMs, isPermanentModelError, isUnauthenticatedProviderError, isUnreachableProviderError } from "./provider-errors.js";
+import { escalatedCooldownMs, isFailoverError, isPermanentModelError, isUnauthenticatedProviderError, isUnreachableProviderError } from "./provider-errors.js";
+import { emptyArmsOf, isEmptyCompletion, withEmptyArms } from "./empty-completion";
+import { coolingRefusal } from "./model-cooldown";
 
 const PAID = "vendor/paid-model";
 const FREE = "vendor/free-model:free";
@@ -22,17 +24,19 @@ const NAMES = [
   "modelPermanentStreak", "isHardExhaustedError", "isRateLimitError", "UNAUTHENTICATED_COOLDOWN_MS", "cooldownMsFor", "modelCooldownMsFor",
   "isModelWilling", "hasCompletionQuota", "completionAdvertised", "syncTurn", "syncCompletionAdvertisement", "scheduleAdvertisementResume",
   "markExhausted", "clearExhausted", "markModelExhausted", "PROBE_BODY", "probeTimers", "scheduleProbe", "probeHeldLane",
+  "anthropicCreditFallback", "walkFallbackModels", "llmCompletionHandler",
 ];
 const NEW = ["heldUntilServed", "holdsUntilServed", "PROBE_BODY", "probeTimers", "scheduleProbe", "probeHeldLane"];
 
 /** The shipped functions over two wire models (and the anthropic lane, when `claude`), a fake clock and fake timers. */
-function world(o: { claude?: boolean; cold?: boolean } = {}) {
+function world(o: { claude?: boolean; cold?: boolean; wire?: boolean; openai?: boolean; openrouter?: boolean } = {}) {
   let clock = 1_000_000;
   const timers: Array<{ at: number; fn: () => void; live: boolean }> = [];
   const shapes: string[][] = [];
   const probes: Array<Record<string, unknown>> = [];
   const answers = new Map<string, Record<string, unknown>>();
   const client = { baseURL: "https://wire.example/v1" };
+  const openai = { baseURL: "https://openai.example/v1" };
   const fns = loadIndexDeclarations(NAMES, {
     Date: { now: () => clock },
     setTimeout: (fn: () => void, ms: number) => { const t = { at: clock + ms, fn, live: true }; timers.push(t); return t; },
@@ -42,13 +46,22 @@ function world(o: { claude?: boolean; cold?: boolean } = {}) {
     PERMANENT_COOLDOWN_DOUBLING: 2, PERMANENT_COOLDOWN_CAP_MS: 24 * 60 * MIN,
     ...ad, markedUntil, escalatedCooldownMs, isPermanentModelError, isUnauthenticatedProviderError, isUnreachableProviderError,
     LLM_PINNED_PROVIDER: null, OPENAI_WIRE_PROVIDERS: [],
-    modelClientMap: new Map([[PAID, client], [FREE, client]]),
-    anthropic: o.claude ? {} : null, openaiClient: null, openrouterClient: null, OPENROUTER_MODEL_SET: new Set(),
+    modelClientMap: new Map(o.wire === false ? [] : [[PAID, client], [FREE, client]]),
+    anthropic: o.claude ? {} : null, openaiClient: o.openai ? openai : null, openrouterClient: o.openrouter ? client : null, OPENROUTER_MODEL_SET: new Set(),
     isDenied: () => false, isRunpodCold: () => o.cold === true,
-    loadPolicy: async () => ({ arms: [PAID, FREE, ...(o.claude ? [CLAUDE] : [])].map((model) => ({ model })) }),
+    loadPolicy: async () => ({ arms: [...(o.wire === false ? [] : [PAID, FREE]), ...(o.claude ? [CLAUDE] : [])].map((model) => ({ model })) }),
+    isFailoverError, isEmptyCompletion, emptyArmsOf, withEmptyArms, coolingRefusal, DEFAULT_MODEL: CLAUDE,
+    readGateParams: async () => ({}), readFallbackOrder: async () => [], fallbackWalkOrder: (keys: string[]) => keys,
+    providerStanding: { admit: () => true, recordFallback() {} },
+    selectArm: async (_t: string, models: string[]) => (models.length > 0 ? { model: models[0] } : null),
+    reasonOf: (e: unknown) => ({ message: String(e) }),
+    pickProvider: (m: string) => (m.startsWith("claude") ? (o.claude ? "anthropic" : null) : o.openai ? "openai" : null),
     daemon: { setShapes: async (s: string[]) => { shapes.push([...s]); } },
     reasonText: (r: unknown) => JSON.stringify(r ?? null),
-    resolveWithOpenAI: async (body: Record<string, unknown>) => { probes.push(body); return answers.get(String(body.model)) ?? refused(BILLING); },
+    resolveWithOpenAI: async (body: Record<string, unknown>, c: unknown = openai) => {
+      probes.push({ ...body, client: c === openai ? "openai" : "wire" });
+      return answers.get(String(body.model ?? "openai")) ?? refused(BILLING);
+    },
     resolveWithAnthropic: async (body: Record<string, unknown>) => {
       probes.push({ ...body, lane: "anthropic" });
       const a = answers.get("anthropic") as unknown;
@@ -199,11 +212,87 @@ describe("a lane refused at the provider level is held until a probe to it is se
   });
 });
 
-describe("every mark for a provider's refusal passes the refusal's class", () => {
-  test("[MUST-FAIL] each markExhausted / markModelExhausted call on a provider_reason says whether it holds until served", async () => {
-    const src = await Bun.file(new URL("./index.ts", import.meta.url).pathname).text();
-    const sites = src.split("\n").filter((l) => /\bmark(Model)?Exhausted\(/.test(l) && l.includes("provider_reason"));
-    expect(sites.length).toBe(5);
-    expect(sites.filter((l) => !/holdsUntilServed\((fb|r|result|retry)\.error\)\)/.test(l))).toEqual([]);
+describe("each call site that cools a lane for a provider's refusal holds it", () => {
+  const ask = (w: ReturnType<typeof world>, model: string) => w.fns.llmCompletionHandler({ body: { type: "llm_completion", prompt: "p", model } });
+
+  test("[MUST-FAIL] anthropic credit-dead with no willing fallback: llm_completion stays dark past 30 minutes; a served probe brings it back", async () => {
+    const w = world({ claude: true, wire: false });
+    await w.fns.syncCompletionAdvertisement();
+    expect(w.advertised()).toBe(true);
+    expect(await w.fns.anthropicCreditFallback(new Error("400 Your credit balance is too low to access the API"), { type: "llm_completion", prompt: "p" })).toBeNull();
+    await w.at(45 * MIN);
+    expect(w.advertised()).toBe(false);
+    w.answers.set("anthropic", served);
+    await w.at(51 * MIN);
+    expect(w.advertised()).toBe(true);
+  });
+
+  test("[MUST-FAIL] the primary provider refused for billing is held (the primary path)", async () => {
+    const w = world({ claude: true, wire: false });
+    w.answers.set("anthropic", refused(BILLING));
+    await ask(w, CLAUDE);
+    await w.at(15 * MIN);
+    expect(w.fns.inCooldown("anthropic")).toBe(true);
+  });
+
+  test("[MUST-FAIL] the primary refused for billing on its last-resort retry is held (the retry path)", async () => {
+    const w = world({ claude: true, wire: false });
+    w.fns.markExhausted("anthropic", "rate limited", 45_000, false);
+    w.answers.set("anthropic", refused(BILLING));
+    await ask(w, CLAUDE);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(1);
+    await w.at(15 * MIN);
+    expect(w.fns.inCooldown("anthropic")).toBe(true);
+  });
+
+  test("[MUST-FAIL] the openai provider held: its probe goes to the openai client and, served, releases it", async () => {
+    const w = world({ openai: true, wire: false });
+    w.answers.set("gpt-test", refused(BILLING));
+    w.answers.set("openai", served);
+    await ask(w, "gpt-test");
+    expect(w.fns.inCooldown("openai")).toBe(true);
+    await w.at(11 * MIN);
+    expect(w.probes.at(-1)).toMatchObject({ client: "openai", max_tokens: 16 });
+    expect(w.probes.at(-1)?.model).toBeUndefined();
+    expect(w.fns.inCooldown("openai")).toBe(false);
+  });
+
+  test("[MUST-FAIL] a wire model refused for billing is held (the wire path)", async () => {
+    const w = world();
+    w.answers.set(PAID, refused(BILLING));
+    w.answers.set(FREE, served);
+    await ask(w, PAID);
+    await w.at(15 * MIN);
+    expect(w.fns.inModelCooldown(PAID)).toBe(true);
+  });
+
+  test("[MUST-FAIL] a model refused for billing in the fallback walk is held (the walk)", async () => {
+    const w = world();
+    w.answers.set(PAID, refused(RATE));
+    w.answers.set(FREE, refused(BILLING));
+    await ask(w, PAID);
+    await w.at(15 * MIN);
+    expect([w.fns.inModelCooldown(PAID), w.fns.inModelCooldown(FREE)]).toEqual([false, true]);
+  });
+
+  test("[MUST-FAIL] a model routed through openrouter refused for billing is held (the openrouter path)", async () => {
+    const w = world({ openrouter: true });
+    const other = "other-vendor/model";
+    w.answers.set(other, refused(BILLING));
+    w.answers.set(PAID, served);
+    await ask(w, other);
+    await w.at(15 * MIN);
+    expect(w.fns.inModelCooldown(other)).toBe(true);
+  });
+
+  test("[GUARD] each path refused by a rate limit returns by its timer", async () => {
+    const w = world({ claude: true });
+    w.answers.set("anthropic", refused(RATE));
+    w.answers.set(PAID, refused(RATE));
+    w.answers.set(FREE, refused(RATE));
+    await ask(w, PAID);
+    await ask(w, CLAUDE);
+    await w.at(2 * MIN);
+    expect([w.fns.inCooldown("anthropic"), w.fns.inModelCooldown(PAID), w.fns.inModelCooldown(FREE)]).toEqual([false, false, false]);
   });
 });
