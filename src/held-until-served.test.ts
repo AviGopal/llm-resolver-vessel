@@ -401,6 +401,23 @@ describe("a lane's window ends at its until: cooling before it, not at it", () =
     expect(w.fns.inModelCooldown(PAID)).toBe(false);
   });
 
+  test("[GUARD] a held lane's probe run a millisecond before its window's end calls nothing; the one probe is at the end", async () => {
+    const w = world({ claude: true });
+    await w.fns.syncCompletionAdvertisement();
+    w.answers.set("anthropic", served);
+    w.fns.markExhausted("anthropic", UNREACHABLE, 30_000, true);
+    const end = w.fns.exhaustedUntil.get("anthropic") as number;
+    await w.at(end - START - 1);
+    // a timer that comes due a millisecond early, as a real one may
+    await w.fns.probeHeldLane("anthropic");
+    await w.flush();
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(0);
+    expect(w.fns.inCooldown("anthropic")).toBe(true);
+    await w.at(end - START);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(1);
+    expect(w.fns.inCooldown("anthropic")).toBe(false);
+  });
+
   test("[GUARD] a held lane's probe due exactly at its window's end calls the lane then", async () => {
     const w = world({ claude: true });
     await w.fns.syncCompletionAdvertisement();
