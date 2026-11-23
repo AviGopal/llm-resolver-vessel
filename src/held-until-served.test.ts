@@ -238,6 +238,38 @@ describe("a lane refused at the provider level is held until a probe to it is se
     expect([w.fns.inCooldown("anthropic"), w.fns.isModelWilling(CLAUDE)]).toEqual([false, true]);
   });
 
+  test("[MUST-FAIL] a provider's probe due half a second before its lane's window ends calls nothing, and fires at the end", async () => {
+    const w = world({ claude: true });
+    await w.fns.syncCompletionAdvertisement();
+    w.answers.set("anthropic", served);
+    w.fns.markExhausted("anthropic", UNREACHABLE, 30_000, true);
+    await w.at(500);
+    // a rate limit marked half a second later moves the window's end 500 ms past the pending probe
+    w.fns.markExhausted("anthropic", RATE, 30_000, false);
+    await w.at(30_000);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(0);
+    expect(w.fns.inCooldown("anthropic")).toBe(true);
+    await w.at(30_500);
+    expect(w.probes.filter((p) => p.lane === "anthropic").length).toBe(1);
+    expect(w.fns.inCooldown("anthropic")).toBe(false);
+  });
+
+  test("[MUST-FAIL] a held model's probe that comes due inside the model's own window calls nothing; the one probe is at its end", async () => {
+    const w = world();
+    await w.fns.syncCompletionAdvertisement();
+    await w.refuseModel(PAID, BILLING);
+    await w.at(5 * MIN);
+    // the model's window, not the provider map, decides: a probe run while the model still cools is moved, not sent
+    await w.fns.probeHeldLane(PAID);
+    await w.flush();
+    expect(w.probes.filter((p) => p.model === PAID).length).toBe(0);
+    expect(w.fns.inModelCooldown(PAID)).toBe(true);
+    w.answers.set(PAID, served);
+    await w.at(10 * MIN + 1);
+    expect(w.probes.filter((p) => p.model === PAID).length).toBe(1);
+    expect(w.fns.inModelCooldown(PAID)).toBe(false);
+  });
+
   test("[MUST-FAIL] a held mark that leaves a longer window in force still holds the lane and leaves its probe pending", async () => {
     const w = world({ claude: true });
     await w.fns.syncCompletionAdvertisement();
