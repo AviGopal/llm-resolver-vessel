@@ -44,6 +44,7 @@ import { reasonOf, reasonText } from "./exhaustion-reason";
 import { unwrapPointerBody } from "./pointer-body";
 import { isExhaustedProviderError, isUnreachableProviderError, isFailoverError, isUnauthenticatedProviderError, isPermanentModelError, escalatedCooldownMs } from "./provider-errors.js";
 import { isBlankText, reasoningPresent, emptyCompletionRefusal, isEmptyCompletion, emptyArmsOf, withEmptyArms, completionAnswered, emptyArmsToCharge } from "./empty-completion";
+import { wireStopReason } from "./stop-reason";
 import { selectArm, recordArmOutcome, servedArmOf, readGateParams, setProviderStanding, readFallbackOrder, fallbackWalkOrder, loadPolicy, lastPolicy, deniedBy, llmModelPolicyHandler, llmModelPolicyWriteHandler, ensureArmsForModels, repriceSeededArm, readMaxInputTokensPerDispatch } from "./model-policy.js";
 import { DispatchLedger, budgetedProviderCall, checkDispatchBudget, dispatchBudgetRefusal, dispatchKeyOf } from "./dispatch-budget.js";
 import { decideLastResort } from "./last-resort.js";
@@ -449,6 +450,7 @@ async function anthropicCreditFallback(
   if (!client) return null;
   console.log(`[llm-resolver-vessel] anthropic credit-dead — falling back to ${fallbackModel}`);
   try {
+    const maxTokens = body.max_tokens ?? DEFAULT_MAX_TOKENS;
     const messages: Array<{ role: "system" | "user"; content: string }> = [];
     if (body.system) messages.push({ role: "system", content: body.system });
     messages.push({ role: "user", content: body.prompt ?? "" });
@@ -457,7 +459,7 @@ async function anthropicCreditFallback(
       readCap: readMaxInputTokensPerDispatch,
       call: () => client.chat.completions.create({
         model: fallbackModel,
-        max_tokens: body.max_tokens ?? DEFAULT_MAX_TOKENS,
+        max_tokens: maxTokens,
         messages,
       }),
       inputTokensOf: (c) => c.usage?.prompt_tokens ?? 0,
@@ -484,6 +486,7 @@ async function anthropicCreditFallback(
         output_tokens: completion.usage?.completion_tokens ?? 0,
         ...(typeof (completion.usage as { cost?: unknown } | undefined)?.cost === "number" ? { cost_usd: (completion.usage as unknown as { cost: number }).cost } : {}),
       },
+      ...wireStopReason(completion.choices?.[0]?.finish_reason, completion.usage?.completion_tokens, maxTokens),
     };
   } catch (fallbackErr) {
     console.error("[llm-resolver-vessel] fallback error:", fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr));
@@ -614,7 +617,7 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
           output_tokens: response.usage?.completion_tokens ?? 0,
           ...(typeof (response.usage as { cost?: unknown } | undefined)?.cost === "number" ? { cost_usd: (response.usage as unknown as { cost: number }).cost } : {}),
         },
-        stop_reason: response.choices[0]?.finish_reason === "length" ? "max_tokens" : response.choices[0]?.finish_reason,
+        ...wireStopReason(response.choices[0]?.finish_reason, response.usage?.completion_tokens, maxTokens),
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

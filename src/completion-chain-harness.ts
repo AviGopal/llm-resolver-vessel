@@ -139,6 +139,7 @@ export function completionChain(opts: ChainOptions): Chain {
   // The empty-completion helpers, at a revision that has them.
   try { Object.assign(stubs, require("./empty-completion")); } catch { /* an earlier revision */ }
   try { Object.assign(stubs, require("./exhaustion-reason")); } catch { /* an earlier revision */ }
+  try { Object.assign(stubs, require("./stop-reason")); } catch { /* an earlier revision */ }
   if (opts.completionHandler) stubs.llmCompletionHandler = opts.completionHandler;
   const CLASS = ["holdsUntilServed", "isRateLimitError", "isHardExhaustedError"];
   const names = [

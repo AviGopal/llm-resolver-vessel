@@ -108,7 +108,7 @@ describe("CONTROLS", () => {
       resolved: true, shape: "llmCompletion", content: "the answer",
       provider: "openai", model: Y,
       usage: { input_tokens: 10, output_tokens: 7 },
-      stop_reason: "stop",
+      stop_reason: "stop", provider_stop_reason: "stop",
     });
     expect(c.calls).toEqual([Y]);
   });

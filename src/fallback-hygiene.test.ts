@@ -13,6 +13,7 @@ import { loadIndexDeclarations } from "./index-fn-harness";
 import * as providerErrors from "./provider-errors";
 import * as emptyCompletion from "./empty-completion";
 import * as exhaustionReason from "./exhaustion-reason";
+import * as stopReason from "./stop-reason";
 import { fallbackWalkOrder } from "./model-policy";
 import { dispatchKeyOf } from "./dispatch-budget";
 
@@ -76,6 +77,7 @@ function hygieneChain(opts: HygieneChainOptions) {
     ...providerErrors,
     ...emptyCompletion,
     ...exhaustionReason,
+    ...stopReason,
     fallbackWalkOrder,
     dispatchKeyOf,
     console: {
