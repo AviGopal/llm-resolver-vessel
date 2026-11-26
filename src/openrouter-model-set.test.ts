@@ -28,6 +28,7 @@ import { join } from "node:path";
 import ts from "typescript";
 import { loadIndexDeclarations } from "./index-fn-harness";
 import { completionChain, textTurn } from "./completion-chain-harness";
+import { deniedBy } from "./model-policy";
 
 // The appended slugs. Hand-written on purpose: deriving them from the registry would make the
 // check vacuous. Extend this table to add a model.
@@ -56,8 +57,9 @@ const OPENROUTER_KEY = "https://openrouter.ai/api/v1";
 
 /** isModelWilling over the shipped registry, with modelClientMap filled the way startup fills it
  * when OPENROUTER_API_KEY is keyed. `anthropic` is the direct client (null = not keyed);
- * `cooling` lists the provider keys in cooldown ("anthropic" or the openrouter baseURL). */
-function willingness(anthropic: unknown = null, cooling: string[] = []) {
+ * `cooling` lists the provider keys in cooldown ("anthropic" or the openrouter baseURL);
+ * `denied` lists owner `denied_models` substrings (empty = no denial). */
+function willingness(anthropic: unknown = null, cooling: string[] = [], denied: string[] = []) {
   const openrouterClient = { baseURL: OPENROUTER_KEY };
   const modelClientMap = new Map<string, unknown>();
   const stubs: Record<string, unknown> = {
@@ -65,16 +67,16 @@ function willingness(anthropic: unknown = null, cooling: string[] = []) {
     modelClientMap, openrouterClient, anthropic,
     isRunpodCold: () => false,
     inModelCooldown: () => false,
-    isDenied: () => false, // no owner denial in these tests (denied-models.test.ts covers it)
+    isDenied: (m: string) => deniedBy({ denied_models: denied }, m),
     inCooldown: (k: string) => cooling.includes(k),
     providerKeyOf: (c: { baseURL?: string }) => String(c.baseURL),
   };
   const fns = loadIndexDeclarations(["OPENAI_WIRE_PROVIDERS", "OPENROUTER_MODEL_SET", "isModelWilling"], stubs);
-  const openrouter = (fns.OPENAI_WIRE_PROVIDERS as Array<{ id: string; models: string[] }>).find((p) => p.id === "openrouter")!;
+  const openrouter = (fns.OPENAI_WIRE_PROVIDERS as Array<{ id: string; models: string[]; routeOnly?: string[] }>).find((p) => p.id === "openrouter")!;
   for (const m of openrouter.models) modelClientMap.set(m, openrouterClient);
   return {
     isModelWilling: fns.isModelWilling as (m: string) => boolean,
-    openrouterModels: openrouter.models, modelClientMap, openrouterClient,
+    openrouterModels: openrouter.models, openrouterRouteOnly: openrouter.routeOnly ?? [], modelClientMap, openrouterClient,
   };
 }
 
@@ -123,6 +125,29 @@ const ROUTE_ONLY = [
   "anthropic/claude-haiku-5.5", "deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash",
   "openai/gpt-6-luna", "minimax/minimax-m3.1-flash", "nvidia/nemotron-3.5-lightning",
 ];
+// Live-verified SOTA paid OpenRouter slugs (2026-11-26): Gemini, DeepSeek/GLM, and Qwen families.
+// Hand-written so the checks are not vacuous. Every slug sits in routeOnly so pinned channels can
+// route to it immediately without auto-seeding unsolicited global policy arms.
+const SOTA_ROUTE_ONLY = [
+  "google/gemini-3.8-flash",
+  "google/gemini-4-hydrogen",
+  "google/gemini-4-carbon",
+  "google/gemini-4-neon",
+  "deepseek/deepseek-v4-pro-0813",
+  "z-ai/glm-5.3",
+  "qwen/qwen3.8-flash",
+  "qwen/qwen4-max",
+];
+const SOTA_INPUT_COST: Record<string, number> = {
+  "google/gemini-3.8-flash": 0.825,
+  "google/gemini-4-hydrogen": 1.5,
+  "google/gemini-4-carbon": 2,
+  "google/gemini-4-neon": 3,
+  "deepseek/deepseek-v4-pro-0813": 0.111,
+  "z-ai/glm-5.3": 0.07,
+  "qwen/qwen3.8-flash": 0.15,
+  "qwen/qwen4-max": 1.425,
+};
 // Every seeded openrouter model and the cost its arm is seeded at.
 const SEEDED_COST: Record<string, number> = {
   "google/gemini-2.5-flash": 0.3, "openai/gpt-4o-mini": 0.15, "deepseek/deepseek-chat-v3-0324": 0.3,
@@ -205,6 +230,61 @@ describe("route-only openrouter models get no policy arm at startup", () => {
   });
 
   test("[CONTROL] the openrouter ids are unchanged, in order", () => {
-    expect(willingness().openrouterModels).toEqual([...EXISTING, ...APPENDED]);
+    expect(willingness().openrouterModels).toEqual([...EXISTING, ...APPENDED, ...SOTA_ROUTE_ONLY]);
+  });
+});
+
+describe("SOTA OpenRouter route-only models (2026-11-26)", () => {
+  test.each(SOTA_ROUTE_ONLY)("[MUST-FAIL] %s is listed, mapped to openrouter, and willing when openrouter is keyed", (id) => {
+    const w = willingness();
+    expect(w.openrouterModels).toContain(id);
+    expect(w.modelClientMap.get(id)).toBe(w.openrouterClient);
+    expect(w.isModelWilling(id)).toBe(true);
+    // Willingness follows the openrouter lane: cooling openrouter makes it unwilling.
+    expect(willingness(null, [OPENROUTER_KEY]).isModelWilling(id)).toBe(false);
+  });
+
+  test.each(SOTA_ROUTE_ONLY)("[MUST-FAIL] %s sits in routeOnly and is not auto-seeded as a global policy arm", async (id) => {
+    expect(willingness().openrouterRouteOnly).toContain(id);
+    const seeded = await seedArms();
+    expect(seeded.has(id)).toBe(false);
+  });
+
+  test.each(SOTA_ROUTE_ONLY)("[MUST-FAIL] %s has its exact published per-Mtok input price in FUNDED_ARM_COST", (id) => {
+    const decl = loadIndexDeclarations(["FUNDED_ARM_COST"], { RUNPOD_ENDPOINT_ID: undefined, RUNPOD_MODELS: [] });
+    const costs = decl.FUNDED_ARM_COST as Record<string, number>;
+    expect(costs[id]).toBe(SOTA_INPUT_COST[id]);
+  });
+
+  test.each(SOTA_ROUTE_ONLY)("[CONTROL] %s is served verbatim through the wire client when pinned", async (id) => {
+    const chain = completionChain({ models: [[id, [textTurn("ok")]]] });
+    const r = await chain.fns.llmCompletionHandler({ body: { prompt: "p", model: id } });
+    expect(r.resolved).toBe(true);
+    expect(chain.calls).toEqual([id]);
+    expect(r.provider).toBe("openai");
+    expect(r.model).toBe(id);
+  });
+
+  test.each(SOTA_ROUTE_ONLY)("[MUST-FAIL] denied_models blocks %s from willingness and pinned completion", async (id) => {
+    // Exact-slug denial blocks this model while leaving a sibling SOTA model willing.
+    const sibling = SOTA_ROUTE_ONLY.find((m) => m !== id)!;
+    const wExact = willingness(null, [], [id]);
+    expect(wExact.isModelWilling(id)).toBe(false);
+    expect(wExact.isModelWilling(sibling)).toBe(true);
+    // Vendor-prefix substring denial blocks it too.
+    const vendor = id.slice(0, id.indexOf("/") + 1);
+    expect(willingness(null, [], [vendor]).isModelWilling(id)).toBe(false);
+    // Handler never calls a denied SOTA model; returns unserved when no permitted fallback exists.
+    const chain = completionChain({ models: [[id, [textTurn("never")]]], denied: [id] });
+    const r = await chain.fns.llmCompletionHandler({ body: { prompt: "p", model: id } });
+    expect(chain.calls).toEqual([]);
+    expect(r).toMatchObject({ resolved: false, unserved: "llm_completion", requested_model: id });
+  });
+
+  test("[CONTROL] phantom-arm guard still refuses unlisted slugs in the new SOTA families", () => {
+    const { isModelWilling } = willingness();
+    expect(isModelWilling("google/gemini-4-argon")).toBe(false);
+    expect(isModelWilling("deepseek/deepseek-v5-phantom")).toBe(false);
+    expect(isModelWilling("qwen/qwen5-phantom")).toBe(false);
   });
 });

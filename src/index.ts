@@ -190,12 +190,20 @@ const OPENAI_WIRE_PROVIDERS: OpenAiWireProvider[] = [
              "anthropic/claude-opus-5.5", "moonshotai/kimi-k3.1-pro", "openai/gpt-6.1-sol",
              "deepseek/deepseek-v4.1-flash-1017", "anthropic/claude-haiku-5.5", "deepseek/deepseek-v4.1-flash",
              "z-ai/glm-5.3-flash", "openai/gpt-6-luna", "minimax/minimax-m3.1-flash",
-             "nvidia/nemotron-3.5-lightning"],
+             "nvidia/nemotron-3.5-lightning",
+             // SOTA paid models (verified live against GET /api/v1/models on 2026-11-26):
+             // Gemini-type, DeepSeek/GLM-type, and FOSS (Qwen) coding/reasoning families.
+             "google/gemini-3.8-flash", "google/gemini-4-hydrogen", "google/gemini-4-carbon",
+             "google/gemini-4-neon", "deepseek/deepseek-v4-pro-0813", "z-ai/glm-5.3",
+             "qwen/qwen3.8-flash", "qwen/qwen4-max"],
     // Route-only until per-task correctness grading exists: a fresh alpha1/beta1 arm would be
     // eligible for format-graded tasks it has never been graded on. Like `models`, a source
     // constant (the same bootstrap debt as the routable set itself).
     routeOnly: ["anthropic/claude-haiku-5.5", "deepseek/deepseek-v4.1-flash", "z-ai/glm-5.3-flash",
-                "openai/gpt-6-luna", "minimax/minimax-m3.1-flash", "nvidia/nemotron-3.5-lightning"] },
+                "openai/gpt-6-luna", "minimax/minimax-m3.1-flash", "nvidia/nemotron-3.5-lightning",
+                "google/gemini-3.8-flash", "google/gemini-4-hydrogen", "google/gemini-4-carbon",
+                "google/gemini-4-neon", "deepseek/deepseek-v4-pro-0813", "z-ai/glm-5.3",
+                "qwen/qwen3.8-flash", "qwen/qwen4-max"] },
   { id: "google", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/", apiKeyEnv: "GOOGLE_API_KEY",
     models: ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3-flash-preview"] },
   // LAST in the registry on purpose: the exhaustion failover walk reads this
@@ -1569,6 +1577,10 @@ const FUNDED_ARM_COST: Record<string, number> = {
   "cohere/north-mini-code:free": 0,
   "anthropic/claude-opus-5.5": 4, "moonshotai/kimi-k3.1-pro": 2, "openai/gpt-6.1-sol": 2,
   "deepseek/deepseek-v4.1-flash-1017": 0.15,
+  "google/gemini-3.8-flash": 0.825, "google/gemini-4-hydrogen": 1.5,
+  "google/gemini-4-carbon": 2, "google/gemini-4-neon": 3,
+  "deepseek/deepseek-v4-pro-0813": 0.111, "z-ai/glm-5.3": 0.07,
+  "qwen/qwen3.8-flash": 0.15, "qwen/qwen4-max": 1.425,
 };
 // DERIVE the providers to seed rather than hardcoding a list.
 //
