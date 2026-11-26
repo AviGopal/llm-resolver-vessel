@@ -597,10 +597,11 @@ async function resolveWithOpenAIUnobserved(body: LlmCompletionRequest, client: O
       if ("refused" in budgeted) return dispatchBudgetRefusal(body, model, budgeted.refused);
       const response = budgeted.response;
       const content = response.choices[0]?.message?.content ?? "";
-      if (isBlankText(response.choices[0]?.message?.content)) {
+      const finishReason = response.choices[0]?.finish_reason as string | null | undefined;
+      if (isBlankText(response.choices[0]?.message?.content) || finishReason === "error") {
         return emptyCompletionRefusal({
           provider: "openai", model, served_model: rawModel, requested_model: rawModel,
-          stop_reason: response.choices[0]?.finish_reason ?? null, completion_tokens: response.usage?.completion_tokens ?? 0,
+          stop_reason: finishReason ?? null, completion_tokens: response.usage?.completion_tokens ?? 0,
           iterations: 1, reasoning_present: reasoningPresent(response.choices[0]?.message), resolver: VESSEL_ID,
           execution_id: body.execution_id, dispatch_id: body.dispatch_id,
         }, { usage: { input_tokens: response.usage?.prompt_tokens ?? 0, output_tokens: response.usage?.completion_tokens ?? 0 } });
@@ -1010,10 +1011,24 @@ const walkFallbackModels = async (
   body: LlmCompletionRequest,
   fromModel: string,
   empties: string[] = [],
+  reason = "provider exhausted",
 ): Promise<Record<string, unknown> | null> => {
+  const DEFAULT_FALLBACK_PREFERENCE = [
+    "google/gemini-3.8-flash",
+    "deepseek/deepseek-v4-pro-0813",
+    "z-ai/glm-5.3",
+    "qwen/qwen3.8-flash",
+    "anthropic/claude-haiku-5.5",
+    "openai/gpt-6-luna",
+  ];
   const tried = new Set<string>([fromModel, ...empties]);
   const gate = await readGateParams();
-  const order = fallbackWalkOrder([...modelClientMap.keys()], await readFallbackOrder());
+  const configuredOrder = await readFallbackOrder();
+  const order = fallbackWalkOrder(
+    [...modelClientMap.keys()],
+    configuredOrder && configuredOrder.length > 0 ? configuredOrder : DEFAULT_FALLBACK_PREFERENCE,
+  );
+  let currentReason = reason;
   for (const fbModel of order) {
     const client = modelClientMap.get(fbModel);
     if (!client || tried.has(fbModel) || inModelCooldown(fbModel) || isDenied(fbModel)) continue;
@@ -1021,7 +1036,7 @@ const walkFallbackModels = async (
     // re-tried on every cooldown expiry: at most one probe per window (provider-standing.ts).
     if (!providerStanding.admit(fbModel, Date.now(), gate)) continue;
     tried.add(fbModel);
-    console.warn(`[llm-resolver-vessel] provider exhausted for '${fromModel}' — falling back to '${fbModel}'`);
+    console.warn(`[llm-resolver-vessel] ${currentReason} for '${fromModel}' — falling back to '${fbModel}'`);
     const fb = await resolveWithOpenAI({ ...body, model: fbModel }, client);
     if (fb.resolved === true) {
       clearExhausted(providerKeyOf(client));
@@ -1030,7 +1045,11 @@ const walkFallbackModels = async (
       // says which model served, and the policy grade credits it instead of fromModel.
       return withEmptyArms({ ...fb, fallback_from: fromModel, served_model: fbModel }, empties);
     }
-    if (isEmptyCompletion(fb)) { empties.push(...emptyArmsOf(fb)); continue; }
+    if (isEmptyCompletion(fb)) {
+      empties.push(...emptyArmsOf(fb));
+      currentReason = `empty/error completion (stop_reason=${String(fb.stop_reason ?? "null")}, tokens=${String(fb.completion_tokens ?? 0)}, reasoning=${Boolean(fb.reasoning_present)})`;
+      continue;
+    }
     if (fb.prompt_ceiling === true) return fb; // a too-large prompt is too large for every model: stop walking
     if (fb.dispatch_budget_exhausted === true) return fb; // the dispatch's allowance is spent for every model too
     if (isFailoverError(fb.error)) markModelExhausted(fbModel, reasonText(fb.provider_reason), modelCooldownMsFor(fbModel, fb.error), holdsUntilServed(fb.error));
@@ -1065,7 +1084,8 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
     const r = await resolveWithOpenAI(body, wireClient);
     if (isEmptyCompletion(r)) {
       empties.push(...emptyArmsOf(r));
-      return (await walkFallbackModels(body, model, empties)) ?? withEmptyArms(r, empties);
+      const emptyReason = `empty/error completion (stop_reason=${String(r.stop_reason ?? "null")}, tokens=${String(r.completion_tokens ?? 0)}, reasoning=${Boolean(r.reasoning_present)})`;
+      return (await walkFallbackModels(body, model, empties, emptyReason)) ?? withEmptyArms(r, empties);
     }
     if (r.resolved === true || !isFailoverError(r.error)) return withEmptyArms(r, empties);
     markModelExhausted(model, reasonText(r.provider_reason), modelCooldownMsFor(model, r.error), holdsUntilServed(r.error));
@@ -1081,7 +1101,8 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
     const r = await resolveWithOpenAI(body, openrouterClient);
     if (isEmptyCompletion(r)) {
       empties.push(...emptyArmsOf(r));
-      return (await walkFallbackModels(body, model, empties)) ?? withEmptyArms(r, empties);
+      const emptyReason = `empty/error completion (stop_reason=${String(r.stop_reason ?? "null")}, tokens=${String(r.completion_tokens ?? 0)}, reasoning=${Boolean(r.reasoning_present)})`;
+      return (await walkFallbackModels(body, model, empties, emptyReason)) ?? withEmptyArms(r, empties);
     }
     if (r.resolved === true || !isFailoverError(r.error)) return r;
     markModelExhausted(model, reasonText(r.provider_reason), modelCooldownMsFor(model, r.error), holdsUntilServed(r.error));
@@ -1122,7 +1143,10 @@ const llmCompletionHandler: ResolverHandler = async (ctx) => {
   // An empty from the primary is walked past too, without cooling the primary.
   if (isEmptyCompletion(result)) empties.push(...emptyArmsOf(result));
   if (result.resolved !== true && (primaryCoolingDown || isFailoverError(result.error) || isEmptyCompletion(result))) {
-    const walked = await walkFallbackModels(body, model, empties);
+    const primaryReason = isEmptyCompletion(result)
+      ? `empty/error completion (stop_reason=${String(result.stop_reason ?? "null")}, tokens=${String(result.completion_tokens ?? 0)}, reasoning=${Boolean(result.reasoning_present)})`
+      : undefined;
+    const walked = await walkFallbackModels(body, model, empties, primaryReason);
     if (walked) return walked;
     // Last resort: every fallback lane is dead or cooling down — try the
     // primary anyway even mid-cooldown (its balance may have just returned).
