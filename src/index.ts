@@ -1180,6 +1180,15 @@ const chargeEmptyCompletion = (model: string, taskType: string | undefined): Pro
 // through ungraded (causal discipline).
 const llmCompletionWithPolicyHandler: ResolverHandler = async (ctx) => {
   const body = ctx.body as LlmCompletionRequest;
+  // CALLER FAULT ABSTAINS: a malformed request is known before any provider
+  // call, so no arm is drawn and none is graded; the fault is recorded against
+  // the calling step and the refusal is returned before selection.
+  const malformed = validateCompletionRequest(body);
+  if (malformed) {
+    recordMalformedRequest(body);
+    return malformed;
+  }
+
   const pinned = typeof body.model === "string" && body.model.length > 0 && body.model !== "auto";
   if (pinned) {
     // A model pin is a PREFERENCE, not a mandate. Model/tier is learned shaped selection
