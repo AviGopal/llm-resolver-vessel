@@ -1,4 +1,4 @@
-import { validateCompletionRequest, recordMalformedRequest } from "./request-validation";
+import { validateCompletionRequest, recordMalformedRequest, malformedRequestSummary } from "./request-validation";
 
 /**
  * llm-resolver-vessel — multi-provider LLM resolver vessel (port 8220).
