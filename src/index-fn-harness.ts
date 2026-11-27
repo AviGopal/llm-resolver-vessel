@@ -9,6 +9,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
+import * as requestValidation from "./request-validation";
 
 const INDEX_PATH = join(import.meta.dir, "index.ts");
 
@@ -50,6 +51,7 @@ export function loadIndexDeclarations(
     get: (t, k) => {
       if (typeof k !== "string") return undefined;
       if (k in t) return t[k];
+      if (k in requestValidation) return (requestValidation as Record<string, unknown>)[k];
       if (k in globalThis) return (globalThis as Record<string, unknown>)[k];
       throw new ReferenceError(`unstubbed identifier '${k}' in index.ts declarations`);
     },
