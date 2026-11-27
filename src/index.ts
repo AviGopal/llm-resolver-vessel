@@ -1496,7 +1496,7 @@ const llmSpendSummaryHandler: ResolverHandler = async () => {
   rollSpendWindow(Date.now());
   return {
     resolved: true, shape: "llmSpendSummary",
-    body: { window_ms: SPEND_WINDOW_MS, current: spendCurrent, previous: spendPrevious, since_start: spendSinceStart, dispatch_budget: { ...dispatchLedger.snapshot(), cap_input_tokens: await readMaxInputTokensPerDispatch() } },
+    body: { window_ms: SPEND_WINDOW_MS, current: spendCurrent, previous: spendPrevious, since_start: spendSinceStart, malformed_requests: malformedRequestSummary(), dispatch_budget: { ...dispatchLedger.snapshot(), cap_input_tokens: await readMaxInputTokensPerDispatch() } },
   };
 };
 
