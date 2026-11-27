@@ -1065,9 +1065,8 @@ const walkFallbackModels = async (
 const llmCompletionHandler: ResolverHandler = async (ctx) => {
   const body = ctx.body as LlmCompletionRequest;
 
-  if (!body.prompt || typeof body.prompt !== "string") {
-    return { resolved: false, shape: "llmCompletion", error: "body must include non-empty 'prompt' string" };
-  }
+  const invalid = validateCompletionRequest(body);
+  if (invalid) return invalid;
 
   const model = body.model ?? DEFAULT_MODEL;
   // The arms that answered empty in this dispatch (empty-completion.ts): an empty is walked past
