@@ -30,20 +30,20 @@ export function validateCompletionRequest(body: unknown): Validation {
   return null;
 }
 
-const malformedRequestCounts: Record<string, { count: number; last_execution_id?: string }> = {};
+const malformedRequestCounts: Record<string, { caller: string; task_type: string; count: number; last_execution_id?: string }> = {};
 
-export function recordMalformedRequest(body: { caller: string; task_type: string; execution_id?: string }): void {
-  const key = `${body.caller}:${body.task_type}`;
+export function recordMalformedRequest(body: { caller?: string; task_type?: string; execution_id?: string }): void {
+  const caller = body.caller ?? "unknown";
+  const task_type = body.task_type ?? "unknown";
+  const key = `${caller}:${task_type}`;
   if (!malformedRequestCounts[key]) {
-    malformedRequestCounts[key] = { count: 0 };
+    malformedRequestCounts[key] = { caller, task_type, count: 0 };
   }
   malformedRequestCounts[key].count++;
   malformedRequestCounts[key].last_execution_id = body.execution_id;
 }
 
 export function malformedRequestSummary(): Array<{ caller: string; task_type: string; count: number; last_execution_id?: string }> {
-  return Object.entries(malformedRequestCounts).map(([key, value]) => {
-    const [caller, task_type] = key.split(":");
-    return { caller, task_type, ...value };
-  });
+  return Object.values(malformedRequestCounts);
 }
+
