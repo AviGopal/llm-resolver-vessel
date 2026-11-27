@@ -5,17 +5,11 @@ type CompletionRequest = { type: "llm_completion", prompt: string };
 type Validation = null | { resolved: false; shape: string; error: string; failure_mode: string; field: string };
 
 export function validateCompletionRequest(body: unknown): Validation {
-  if (typeof body !== "object" || body === null || !("type" in body) || body.type !== "llm_completion") {
-    return {
-      resolved: false,
-      shape: "llmCompletion",
-      error: "body must be an object with type 'llm_completion'",
-      failure_mode: "malformed_request",
-      field: "body",
-    };
-  }
-
-  const completionRequest = body as CompletionRequest;
+  // Only the prompt is classified as a caller fault. A body without `type:
+  // "llm_completion"` is NOT malformed: llmCompletionHandler's old inline check
+  // only guarded the prompt, and openrouter-model-set pins that requests sent
+  // without the type field still reach the model logic.
+  const completionRequest = (body ?? {}) as CompletionRequest;
 
   if (typeof completionRequest.prompt !== "string" || completionRequest.prompt.trim() === "") {
     return {
